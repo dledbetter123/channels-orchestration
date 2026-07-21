@@ -70,6 +70,17 @@ analysis, and later a $125 idle-GPU incident. Result: provisioning centralized t
 role, "analysis happens with zero pods running", and teardown the instant a lane
 finishes.
 
+**The guardrail that was never wired up.** The protocol told every agent that over-policy
+GPU configurations were "hard-blocked at the API". They were not: the billing account's
+limit sat far above the policy line and could not be lowered at all, so the block agents
+were told to rely on had never existed. Result: the claim was withdrawn under a major
+protocol bump, in those words rather than a quiet rewording, and the spend line is now
+documented as **a policy that agents enforce**. The general form is worth stating plainly,
+because it is not specific to spend: an agent that believes a guardrail is mechanically
+enforced reasons more loosely than one that knows the guardrail is its own discipline. A
+safety claim that is merely aspirational is worse than no claim at all, because it quietly
+spends the caution it promised to supply.
+
 **The forgotten-pod scenario.** The billing account auto-recharges, so a wedged or
 forgotten pod bills forever with no wall to stop it. Result: the bus registry is diffed
 against the live billing account, aggregate burn is watched continuously, and a

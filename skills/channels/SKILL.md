@@ -149,12 +149,18 @@ preference; it is how the operator wants to be driven.
   tech-support`, scaffolds the full preflight bundle); tech-support verifies the box, launches it,
   registers it, and hands you SSH. You own the workload and pull+checksum artifacts, then notify
   tech-support to tear down — you do NOT terminate. Kill authority (burn-breach / idle hardware) is
-  tech-support's; if you think your own pod must die, say so, don't reach for the API. **The account
-  spend cap is the authorization boundary:** RunPod spendLimit is a hard **$1.50/hr** backstop (fits
-  up to two 4090s ~$1.38/hr). tech-support provisions anything under $1.50/hr on its own authority;
-  anything over — a bigger/multi-GPU box — is hard-blocked at the API and **requires David's
-  explicit authorization** to raise the cap (via the researcher; David sets it in the console). Need
-  more compute than the cap → consult David, don't route around it. Full flow in `runpod-ops`.
+  tech-support's; if you think your own pod must die, say so, don't reach for the API. **The
+  $1.50/hr authorization boundary is a POLICY, and it is enforced by AGENTS, not by the account
+  (operator, 2026-07-21).** tech-support provisions any right-sized config under **$1.50/hr** on its
+  own authority; anything over **requires David's explicit authorization** via the researcher.
+  **CORRECTION — the earlier claim that this is "hard-blocked at the API" was WRONG and is
+  withdrawn.** The RunPod account limit is **$80/hr and cannot be lowered** (the API key lacks the
+  scope, and David has confirmed it is not adjustable). So nothing at the vendor stops a runaway
+  before **$80/hr**: the only things standing in front of that number are tech-support's provisioning
+  gate, the **$2/hr burn ceiling** with its ~2-minute burn-watch, and the throttled email alarm. Do
+  not reason about spend as if a hardware backstop will catch you — **it will not.** Need more
+  compute than the policy allows → consult David; there is no cap to raise, so the answer is a
+  decision, not a setting. Full flow in `runpod-ops`.
 - **RunPod discipline is non-negotiable — full rules live in the `runpod-ops` skill; LOAD IT
   before you launch, connect to, monitor, or tear down any pod.** Do not run a pod from memory of
   these rules; the `runpod-ops` skill was tightened (2026-07-18) and you MUST reload it. The

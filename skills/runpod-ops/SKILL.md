@@ -86,15 +86,24 @@ that used zero GPU; one gate now stands between "a lane wants compute" and "mone
 - **Kill authority:** tech-support may kill any pod unilaterally on a burn-ceiling breach or
   idle-hardware finding (that IS the flow-guard working). A lane that believes its own pod must die
   says so to tech-support; it does not reach for the API.
-- **The account spend cap IS the authorization boundary (operator directive 2026-07-18).** The
-  RunPod **spendLimit is $1.50/hr** — chosen to allow up to two 4090s (~$1.38/hr) for routine work.
-  tech-support provisions any right-sized configuration that fits **under $1.50/hr** on its own
-  authority (one or two 4090s, or a single GPU under the cap). **Anything that would exceed $1.50/hr
-  — a third 4090, a larger/multi-GPU box, an A100 above the cap — is hard-blocked at the API and
-  requires David's explicit authorization** to raise the cap. Route the need to the researcher (the
-  operator interface) and wait; David raises the cap himself in the RunPod console (it can't be
-  raised by the user API key — needs admin scope). tech-support does NOT route around the cap; more
-  compute than the cap allows means David gets consulted, not that the limit gets bumped quietly.
+- **The $1.50/hr authorization boundary is a POLICY, enforced by AGENTS, not by the account
+  (operator directive 2026-07-18, enforcement corrected by the operator 2026-07-21).**
+  tech-support provisions any right-sized configuration under **$1.50/hr** on its own authority (one
+  or two 4090s ~$1.38/hr, or a single GPU under the line). **Anything over $1.50/hr requires David's
+  explicit authorization**, routed through the researcher.
+  - **CORRECTION, and read it before you reason about spend: the earlier "hard-blocked at the API"
+    claim was WRONG and is withdrawn.** The RunPod account limit is **$80/hr and CANNOT be lowered**
+    — the user API key lacks the scope, and the operator has confirmed the account value is not
+    adjustable at all. There was never a $1.50/hr vendor block, and there will not be one.
+  - **What that means operationally:** nothing at the vendor stops a runaway before **$80/hr**. The
+    entire defense is three soft, agent-side controls — tech-support's provisioning gate, the
+    **$2/hr burn ceiling** caught within ~2 minutes by the burn-watch, and the throttled email that
+    reaches David with no session running. Treat every one of them as load-bearing; a missed
+    burn-watch is not a redundancy failure, it is the failure.
+  - **A "raise the cap" request is now meaningless** — there is no cap to raise. Over-policy compute
+    is a DECISION David makes, not a setting anyone changes. tech-support does not route around the
+    policy on the grounds that the account would technically allow it; the account allowing it is
+    precisely the hazard this policy exists to cover.
 - This composes with everything below: the **$2/hr** tripwire, right-size, verified-not-redundant,
   spend reporting, verified-pull-before-stop. The rules below still bind whoever runs the workload;
   the launch/terminate *actions* in them are tech-support's alone.

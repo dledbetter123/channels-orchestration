@@ -28,17 +28,30 @@ The flow:
    breach or an idle-hardware finding. A lane that believes its own pod must die says so;
    it does not reach for the API.
 
-## The spend cap is the authorization boundary
+## The spend policy is the authorization boundary, and agents enforce it
 
-The billing account carries a hard hourly spend limit, sized to the largest routine
-configuration (in this deployment: two consumer GPUs). tech-support provisions anything
-under the cap on its own authority. Anything over it is hard-blocked at the API and
-requires the human operator to raise the cap personally, routed through the researcher.
-More compute than the cap allows means the operator gets consulted, never that the limit
-gets bumped quietly.
+An hourly spend line sized to the largest routine configuration (in this deployment: two
+consumer GPUs) separates what tech-support may provision on its own authority from what
+needs the human operator's explicit decision, routed through the researcher.
 
-On top of the cap:
+**This line is a policy, not a vendor control, and the difference matters enough to have
+been a documented mistake.** An earlier version of this protocol claimed over-policy
+configurations were "hard-blocked at the API". They were not. The billing account's own
+limit sat far above the policy line and turned out not to be adjustable at all, so the
+block that agents were told to rely on never existed. The claim was withdrawn and both
+skills corrected under a major protocol bump, with the withdrawal stated explicitly rather
+than quietly reworded, so anyone carrying the old belief would see it contradicted.
 
+The lesson generalizes past this one system: **an autonomous agent that believes a
+guardrail is mechanically enforced will reason more loosely than one that knows the
+guardrail is its own discipline.** If a control is soft, say so in the protocol, in those
+words. A safety claim that is merely aspirational is worse than no claim, because it
+silently spends the caution it promised to provide.
+
+What actually stands between this system and a runaway bill, all of it agent-side:
+
+- **The provisioning gate**: one role holds the billing actions, and it refuses a request
+  that exceeds the policy line rather than sizing up to what the account would permit.
 - **A burn ceiling** (aggregate running-pod dollars per hour) acts as a tripwire, not a
   budget: burn above it means a job is *wrong* (almost always CPU/RAM work rented on a GPU
   box) and gets redone right-sized, not paid for. A live burn-watch catches a breach
