@@ -1,0 +1,2050 @@
+#!/usr/bin/env bash
+# ch — the channel bus helper. Publish, poll, and track promises.
+set -euo pipefail
+
+# CHANNELS_HOME first: without it there is no way to point this at a throwaway bus, so every
+# smoke test lands in the LIVE agents' inboxes. That has happened twice (b703d50, 1d40453).
+# Falls back to the repo the script lives in, so a bare `./bin/ch` still works.
+ROOT="${CHANNELS_HOME:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+# `ops` is the operator broadcast lane: David (or a bootstrapping session) publishes there,
+# every agent subscribes, no agent publishes to it as a worker.
+#
+# `tech-support` is the bus's own maintainer — the one who owns bin/ch, the hooks, and the
+# protocol. It exists because the alternative is what actually happened: infrastructure was
+# being repaired from OUTSIDE the bus, so two sessions edited the same hook at the same time
+# and neither could see the other. A tool nobody on the bus is responsible for is a tool that
+# rots while everyone assumes someone else is watching it. Research agents report bus faults
+# HERE and keep doing research; they do not fix the bus themselves.
+CHANNELS=(auditor researcher writer builder ops tech-support)
+AGENTS=(auditor researcher writer builder tech-support)   # channels that can RECEIVE mail
+
+# ── multi-instance identity: LEADER + WORKERS ────────────────────────────────
+# A lane can run MORE THAN ONE live session at once. Identities:
+#   <role>            the base instance (instance 1) = the LEADER / manager — e.g. builder
+#   <role>#<n>        an additional concurrent instance (n>=2) = a WORKER — e.g. builder#2
+# The FIRST instance of a role is the leader; it owns all role-addressed traffic and
+# intelligently DISTRIBUTES work to the workers, balancing load. Workers do delegated slices and
+# report back to the leader. A worker is a full bus citizen (own .mail/.watch/.subs/HANDOFF +
+# outbox dir), but its CHANNEL is its role: builder#2 publishes as `from: builder#2` on the
+# `builder` channel. Addressing the ROLE (subscribers: [builder]) lands on the LEADER — no
+# fan-out; the leader delegates to a worker by naming it (subscribers: [builder#2]); the worker
+# reports back with subscribers: [builder]. So coexisting instances all subscribe to the role
+# channel (ch join wires this), which is the shared leader↔worker coordination space. With no
+# sub-instances present, every path below is byte-identical to the single-instance bus.
+agent_role() { printf '%s\n' "${1%%#*}"; }            # builder#2 -> builder ; builder -> builder
+is_instance() { case "$1" in *'#'*) return 0 ;; *) return 1 ;; esac; }   # is it a <role>#n sub-instance?
+is_agent() {   # accept base roles AND <role>#<digits>
+  local r; r="$(agent_role "$1")"
+  if is_instance "$1"; then [[ "${1##*#}" =~ ^[0-9]+$ ]] || return 1; fi
+  [[ " ${AGENTS[*]} " == *" $r "* ]]
+}
+online_agents() {   # every identity that has come online (has a .subs file) — base roles + sub-instances
+  local f b
+  for f in "$ROOT"/.subs/*; do [ -e "$f" ] || continue; b="$(basename "$f")"; is_agent "$b" && echo "$b"; done
+}
+watch_alive() {   # <agent> -> 0 if a NON-orphan watch for it is alive (a genuinely live session), else 1
+  local pidf="$ROOT/.watch/$1.pid" old oppid
+  [ -f "$pidf" ] || return 1
+  old="$(cat "$pidf" 2>/dev/null)"
+  [ -n "$old" ] && [ "$old" != "$$" ] && kill -0 "$old" 2>/dev/null || return 1
+  oppid="$(ps -o ppid= -p "$old" 2>/dev/null | tr -d ' ')"
+  [ "$oppid" = "1" ] && return 1        # orphaned watch (session died) — not a live session
+  return 0
+}
+live_instances() {   # <role> -> instance ids of that role with a LIVE watch (base + sub-instances)
+  local role="$1" a
+  for a in "$role" $(online_agents | grep -E "^${role}#[0-9]+$" || true); do
+    watch_alive "$a" && echo "$a"
+  done
+}
+next_instance() {   # <role> -> the next free "<role>#<n>" (n starts at 2)
+  local role="$1" n=2
+  while online_agents | grep -qx "${role}#${n}"; do n=$((n + 1)); done
+  echo "${role}#${n}"
+}
+board_agents() {   # base roles + the worker instances worth surfacing on the board / pods / stuck
+  # views. A worker shows if it is LIVE (non-orphan watch) OR holds a registered pod — so an
+  # abandoned worker pod still surfaces even after its session dies. A dead, podless worker stays
+  # off: its mail is durable and resurfaces when that identity resumes; listing it is just noise.
+  printf '%s\n' "${AGENTS[@]}"
+  local w pd
+  for w in $(online_agents | grep -E '#[0-9]+$' || true); do
+    if watch_alive "$w"; then echo "$w"; continue; fi
+    pd="$(pod_dir "$w")"
+    [ -d "$pd" ] && [ -n "$(ls -A "$pd" 2>/dev/null)" ] && echo "$w"
+  done
+}
+notify_join() {   # <worker-id> <role> <project> — drop a join notice in tech-support's inbox so its
+  # watch fires the moment a worker comes online and the onboarding is monitored by DEFAULT, not
+  # only when a human happens to be looking. Delivers on the ROLE channel, which tech-support already
+  # subscribes to (default_subs), so it lands with no UNDELIVERABLE; the leader is not named, so no
+  # fan-out. No-op when the joiner's own role IS tech-support: the tech-support LEADER already
+  # receives the worker's brief-request directly, so a self-notice would be redundant.
+  local id="$1" role="$2" project="$3"
+  [ "$role" = "tech-support" ] && return 0
+  local dir="$ROOT/$project/$id/$(today)-joining-notice"
+  [ -e "$dir/MESSAGE.md" ] && return 0            # idempotent: a re-run of ch join won't double-notify
+  mkdir -p "$dir"
+  local subject="tech-support notice: $id joined $project on the $role channel — onboarding handshake starting; watch it to completion"
+  cat > "$dir/MESSAGE.md" <<EOF
+---
+from: $id
+project: $project
+date: $(today)
+subscribers: [tech-support]
+status: open
+asks: null
+re: null
+promises: null
+resolves: null
+refs: []
+---
+
+# $id came online on the $role channel — onboarding handshake starting
+
+## What happened
+A new worker ($id) joined $project via \`ch join\`. Next it sends a live brief-request to the
+$role leader, \`ch await\`s the briefing, and once briefed arms its own watch — at which point it
+becomes a live worker (visible on \`ch instances $role\` / \`ch board\`).
+
+## What this means for you (tech-support)
+Monitor this handshake to completion — it is your bus, and a worker that stalls waiting for a
+briefing looks exactly like nothing happening. Keep this notice UNACKED until $id is live
+(\`ch instances $role\` shows it as a worker); ack it then. If the briefing does not land in a few
+minutes, surface it (the leader may be drowning). You do not run the work — you make sure the
+plumbing of the join worked: delivery landed, no UNDELIVERABLE, the await will wake.
+
+## Artifacts
+- Worker id: $id (coordinates on the $role channel). Leader: $role.
+
+## What I need next
+Nothing blocking — this is a notification. You are now aware $id is onboarding; watch it land.
+EOF
+  git_retry add -- "$dir/MESSAGE.md" >/dev/null 2>&1 || true
+  local sha=""
+  if git -C "$ROOT" commit -q -m "$id(joining): $subject" -- "$dir/MESSAGE.md" >/dev/null 2>&1; then
+    sha="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || true)"
+  fi
+  if [ -n "$sha" ]; then
+    deliver "$sha" "$role" "$id" "tech-support" "$subject" >/dev/null 2>&1 || true
+    echo "  📣 notified tech-support that '$id' is onboarding (delivered on the '$role' channel) — it monitors the handshake by default"
+  else
+    # never fatal to the join: the worker is online regardless of whether the notice committed
+    echo "  (note: could not commit the tech-support join-notice — proceed; ask tech-support to watch your handshake)"
+  fi
+}
+
+# ── subscription is an EVENT, not a table ────────────────────────────────────
+# A channel reaches you because you SUBSCRIBED to it, and that subscription is a commit you
+# can point at (`git log -- .subs`). Nothing else grants delivery — not being named in
+# `subscribers:`, not being a known agent. If you are not subscribed, mail on that channel is
+# not yours, and the bus says so out loud rather than dropping it.
+#
+# .subs/<agent> — one channel per line. Seeded once from the defaults below, then owned by
+# the agent: `ch subscribe <you> <channel>` / `ch unsubscribe <you> <channel>`.
+default_subs() {
+  # A sub-instance defaults to its role's subscriptions PLUS its own role channel, so it can
+  # see the incumbent it is assisting/replacing (the base role never reads its own channel, but
+  # a DISTINCT instance legitimately watches the role's traffic to coordinate).
+  local role; role="$(agent_role "$1")"
+  local base=""
+  case "$role" in
+    auditor)      base="researcher writer builder ops tech-support" ;;
+    researcher)   base="auditor writer builder ops tech-support" ;;
+    writer)       base="researcher auditor builder ops tech-support" ;;
+    builder)      base="researcher auditor writer ops tech-support" ;;
+    # tech-support follows every lane: a bus fault surfaces in someone else's traffic.
+    tech-support) base="auditor researcher writer builder ops" ;;
+    *) echo "unknown agent: $1" >&2; return 1 ;;
+  esac
+  if is_instance "$1"; then echo "$base $role"; else echo "$base"; fi
+}
+
+ensure_subs() { # <agent> — seed the subscription file on first use
+  local agent="$1" f="$ROOT/.subs/$1"
+  [ -f "$f" ] && return 0
+  mkdir -p "$ROOT/.subs"
+  default_subs "$agent" | tr ' ' '\n' | grep -v '^$' > "$f"
+  git_retry add -- ".subs/$agent" 2>/dev/null || true
+  git -C "$ROOT" diff --cached --quiet -- ".subs/$agent" 2>/dev/null || \
+    git_retry commit -q -m "subscribe($agent): $(tr '\n' ' ' < "$f")" 2>/dev/null || true
+}
+
+# NEITHER of these seeds. Asking "is the writer subscribed?" must not SUBSCRIBE the writer —
+# otherwise the first message anyone sends silently enrolls an agent that has never once come
+# online, and it wakes up to a backlog it was never listening for. Only an agent coming online
+# (`ch resume`) or an explicit `ch subscribe` creates a subscription.
+subs_of() { [ -f "$ROOT/.subs/$1" ] && tr '\n' ' ' < "$ROOT/.subs/$1" || true; }
+
+subscribed_to() { # <agent> <channel> → 0 if subscribed. No file = never came online = no.
+  [ -f "$ROOT/.subs/$1" ] || return 1
+  grep -qx "$2" "$ROOT/.subs/$1" 2>/dev/null
+}
+
+cmd_subscribe() { # ch subscribe <agent> <channel>
+  local agent="$1" chan="$2"
+  is_agent "$agent" || die "no such agent: $agent"
+  [[ " ${CHANNELS[*]} " == *" $chan "* ]]  || die "no such channel: $chan"
+  ensure_subs "$agent"
+  if subscribed_to "$agent" "$chan"; then echo "$agent already subscribes to $chan"; return 0; fi
+  echo "$chan" >> "$ROOT/.subs/$agent"
+  git_retry add -- ".subs/$agent"
+  git_retry commit -q -m "subscribe($agent): + $chan"
+  # Subscription starts delivery HERE. It does not hand you the channel's past: you were not
+  # subscribed then, so that mail was never yours. `git log -- <project>/<chan>` if you want
+  # the history; the mailbox is for what was addressed to you while you were listening.
+  echo "$agent now subscribes to $chan — mail published from now on will be delivered"
+}
+
+cmd_unsubscribe() { # ch unsubscribe <agent> <channel>
+  local agent="$1" chan="$2"
+  ensure_subs "$agent"
+  subscribed_to "$agent" "$chan" || { echo "$agent does not subscribe to $chan"; return 0; }
+  grep -vx "$chan" "$ROOT/.subs/$agent" > "$ROOT/.subs/$agent.tmp" && mv "$ROOT/.subs/$agent.tmp" "$ROOT/.subs/$agent"
+  git_retry add -- ".subs/$agent"
+  git_retry commit -q -m "unsubscribe($agent): - $chan"
+  echo "$agent no longer subscribes to $chan"
+}
+
+cmd_subs() { # ch subs [agent] — who listens to what
+  local a
+  for a in "${AGENTS[@]}"; do
+    [ -n "${1:-}" ] && [ "$a" != "$1" ] && continue
+    local sub; sub="$(subs_of "$a")"
+    printf '  %-13s → %s\n' "$a" "${sub:-(never came online — not subscribed, receives nothing)}"
+  done
+}
+
+die() { echo "ch: $*" >&2; exit 1; }
+
+# Shared worktree: several agent sessions commit here. Retry through index.lock.
+git_retry() {
+  local n=0
+  until git -C "$ROOT" "$@"; do
+    n=$((n + 1))
+    [ "$n" -ge 5 ] && die "git $1 failed after $n attempts"
+    sleep 1
+  done
+}
+
+today() { date +%Y-%m-%d; }
+
+# ── write-ahead: state the intent BEFORE composing the artifact ───────────────
+# The loss window is COMPOSITION, not the write. An agent holds a long message in context
+# for many turns before any tool call fires; if a compact lands in there, the whole thing
+# evaporates and the next session has no idea it was ever attempted. So the intent goes to
+# disk first, in a commit of its own, and the artifact follows.
+
+cmd_intend() { # ch intend <project> <agent> "<what I am about to write>"
+  local project="$1" agent="$2"; shift 2
+  local summary="$*"
+  [ -n "$summary" ] || die "intend needs a one-line expectation summary"
+  local h; h="$(cmd_handoff "$project" "$agent")"
+  python3 - "$h" "$summary" "$(date +%H:%M)" <<'PYEOF'
+import sys, re
+path, summary, ts = sys.argv[1], sys.argv[2], sys.argv[3]
+s = open(path).read()
+block = f"## In flight (write-ahead)\n{ts} — {summary}\n"
+if "## In flight (write-ahead)" in s:
+    s = re.sub(r"## In flight \(write-ahead\)\n(?:(?!\n## ).*\n)*", block, s, count=1)
+else:
+    s = s.replace("## Mid-flight", block + "\n## Mid-flight", 1) if "## Mid-flight" in s else s + "\n" + block
+open(path, "w").write(s)
+PYEOF
+  git_retry add -- "$project/$agent/HANDOFF.md"
+  git -C "$ROOT" diff --cached --quiet -- "$project/$agent/HANDOFF.md" || \
+    git_retry commit -q -m "intend($project/$agent): $summary"
+  echo "intent recorded: $summary"
+}
+
+cmd_note() { # ch note <project> <agent> "<one line>" — continuous handoff population
+  local project="$1" agent="$2"; shift 2
+  local line="$*"
+  [ -n "$line" ] || die "note needs a line"
+  local h; h="$(cmd_handoff "$project" "$agent")"
+  python3 - "$h" "$line" "$(date +%H:%M)" <<'PYEOF'
+import sys
+path, line, ts = sys.argv[1], sys.argv[2], sys.argv[3]
+s = open(path).read()
+hdr = "## Running log (since last rewrite)"
+entry = f"- {ts} {line}\n"
+if hdr in s:
+    i = s.index(hdr) + len(hdr) + 1
+    s = s[:i] + entry + s[i:]
+else:
+    s = s.rstrip() + f"\n\n{hdr}\n{entry}"
+open(path, "w").write(s)
+PYEOF
+  git_retry add -- "$project/$agent/HANDOFF.md"
+  git -C "$ROOT" diff --cached --quiet -- "$project/$agent/HANDOFF.md" || \
+    git_retry commit -q -m "note($project/$agent): $line"
+  echo "noted"
+}
+
+cmd_new() { # ch new <project> <channel> <slug> "<expectation summary>"
+  local project="$1" channel="$2" slug="$3"; shift 3
+  local expect="$*"
+  # The sender is a role OR a <role>#N sub-instance; a sub-instance owns its own outbox dir and
+  # publishes on its role's channel (routing happens in cmd_send's deliver call).
+  is_agent "$channel" || die "no such sender identity: $channel (a role, or <role>#N)"
+  if [ -z "$expect" ]; then
+    die "ch new needs an EXPECTATION SUMMARY as its 4th argument:
+
+  ch new $project $channel $slug \"one line: what this message will say\"
+
+Why: you are about to compose something long. If the context compacts while you are
+composing it, the whole thing is lost and nobody knows it was ever attempted. The summary
+lands in your HANDOFF.md in its own commit FIRST, so the intent survives even if the
+message does not."
+  fi
+  [ "$channel" != "ops" ] && cmd_intend "$project" "$channel" "writing message '$slug': $expect" >/dev/null || true
+  local dir="$ROOT/$project/$channel/$(today)-$slug"
+  [ -e "$dir/MESSAGE.md" ] && die "message already exists: $dir/MESSAGE.md (append-only — pick a new slug)"
+  mkdir -p "$dir"
+  cat > "$dir/MESSAGE.md" <<EOF
+---
+from: $channel
+project: $project
+date: $(today)
+subscribers: []
+status: open
+asks: null
+re: null
+promises: null
+resolves: null
+refs: []
+---
+
+# <one-line subject>
+
+## What happened
+
+## What this means for you
+
+## Artifacts
+
+## What I need next
+EOF
+  echo "$dir/MESSAGE.md"
+}
+
+cmd_send() { # ch send <project> <channel> <slug> <subject...>
+  local project="$1" channel="$2" slug="$3"; shift 3
+  local subject="$*"
+  [ -n "$subject" ] || die "send needs a one-line subject"
+  local rel="$project/$channel/$(today)-$slug"
+  [ -d "$ROOT/$rel" ] || die "no such message dir: $rel (run 'ch new' first)"
+  [ -f "$ROOT/$rel/MESSAGE.md" ] || die "$rel has no MESSAGE.md"
+
+  # A field counts as set when its value is neither empty nor the literal `null`.
+  # A missing field is normal, not an error — grep exits 1 on a miss and `set -e` would
+  # kill the send silently. Absorb it.
+  field() { grep -E "^$1:" "$ROOT/$rel/MESSAGE.md" 2>/dev/null | head -1 | cut -d: -f2- \
+              | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | tr -d '"' || true; }
+  local tag="" prom res asks re
+  prom="$(field promises)"; res="$(field resolves)"
+  asks="$(field asks)";     re="$(field re)"
+  [ -n "$prom" ] && [ "$prom" != "null" ] && tag=" [promises]"
+  # resolves: is LIST-VALUED, symmetric to re: (builder af62fcf). One message often delivers or
+  # withdraws a burst of promises. Single-valued resolves emitted "[resolves [a, b]]", which
+  # ch open's `\[resolves [0-9a-f]+\]` scan does not match, so NEITHER promise closed — the same
+  # wedged-open-list failure the re: fix (aca1ca4) was for. Loop, one [resolves <sha>] per sha.
+  if [ -n "$res" ] && [ "$res" != "null" ]; then
+    local rs; for rs in $(echo "$res" | tr -d '[]"'"'"'' | tr ',' ' '); do
+      git -C "$ROOT" cat-file -e "$rs^{commit}" 2>/dev/null || die "resolves: names an unknown commit: $rs"
+      tag="$tag [resolves $(git -C "$ROOT" rev-parse --short "$rs")]"
+    done
+  fi
+  # asks: <channel> — I need a reply FROM that channel and I am going to wait for it.
+  if [ -n "$asks" ] && [ "$asks" != "null" ]; then
+    is_agent "$asks" || die "asks: must name a role or instance (e.g. builder, builder#2), got '$asks'"
+    tag="$tag [asks $asks]"
+  fi
+  # re: <sha> or re: [<sha>, <sha>...] — this IS the reply to those asks.
+  #
+  # re: WAS single-valued while ch open closed on re: and nothing else, so ONE considered reply
+  # answering a BURST of asks stranded all but one of them open forever (researcher aca1ca4,
+  # auditor 73e3825). refs: does not close an ask; the body does not close an ask. The stranded
+  # asks then sat screaming in `ch open` as work that was already done — and a false positive is
+  # worse than a miss here, because it teaches four agents to skim the outstanding list, which is
+  # the only thing standing between this bus and a dropped promise. It made the researcher publish
+  # a confession for a bookkeeping failure that never happened: the bus made an agent apologise
+  # for a bug in the bus.
+  #
+  # Now list-valued. Every SHA named is closed, each gets its own [re <sha>] tag, and every asker
+  # must be addressed back. ch open already scans tags globally, so it needed no change.
+  local re_list=""
+  if [ -n "$re" ] && [ "$re" != "null" ]; then
+    re_list="$(echo "$re" | tr -d '[]"'"'"'' | tr ',' ' ')"
+    local r asker short
+    for r in $re_list; do
+      git -C "$ROOT" cat-file -e "$r^{commit}" 2>/dev/null || die "re: names an unknown commit: $r"
+      asker="$(git -C "$ROOT" log -1 --format=%s "$r" | sed -E 's/^([a-z-]+(#[0-9]+)?)\(.*/\1/')"
+      grep -q "^subscribers:.*$asker" "$ROOT/$rel/MESSAGE.md" \
+        || die "re: $r was sent by '$asker' — your subscribers: list must address them back"
+      short="$(git -C "$ROOT" rev-parse --short "$r")"
+      tag="$tag [re $short]"
+    done
+  fi
+
+  # The cheap half of the same defect (researcher's own suggestion): a reply that CITES an open
+  # ask in refs:, or answers it in the body, but does not name it in re:, leaves it open and says
+  # nothing. `ch send` already shouts UNDELIVERABLE when mail cannot land; an ask silently left
+  # open is the same class of failure and had no warning at all. Warn, do not block: only the
+  # author knows whether a cited ask was actually answered here.
+  local refs_field; refs_field="$(field refs | tr -d '[]"'"'"'' | tr ',' ' ')"
+  # Pre-compute the asks ALREADY closed by some message. Build it with grep -oE, which reads
+  # ALL of git log's output — NOT `git log | grep -q`, whose early exit on the first match
+  # SIGPIPE-kills git log so that under `set -o pipefail` the pipeline reports 141 (failure)
+  # EVEN WHEN THE PATTERN MATCHED. That false-failure made this check misfire and warn about
+  # asks already closed (researcher f9b67fa; worsened as the log grew). Tokens are the short
+  # shas inside any [re <sha>] / [resolves <sha>] tag in history.
+  local closed_tokens
+  closed_tokens="$(git -C "$ROOT" log --format=%s | grep -oE '\[(re|resolves) [0-9a-f]+\]' \
+                     | awk '{print $2}' | tr -d ']')"
+  local rf rf_full rf_sub open_unclosed="" tok already
+  for rf in $refs_field; do
+    git -C "$ROOT" cat-file -e "$rf^{commit}" 2>/dev/null || continue
+    echo " $re_list " | grep -q " $rf " && continue                      # named in re: — closed here
+    rf_sub="$(git -C "$ROOT" log -1 --format=%s "$rf")"
+    echo "$rf_sub" | grep -q "\[asks $channel\]" || continue           # not an ask aimed at me
+    # already closed by SOME message? match by full-sha PREFIX so a short-hash length change
+    # (git lengthens shorts as the repo grows) cannot cause a miss.
+    rf_full="$(git -C "$ROOT" rev-parse "$rf")"; already=""
+    while IFS= read -r tok; do
+      [ -n "$tok" ] || continue
+      case "$rf_full" in "$tok"*) already=1; break;; esac
+    done <<< "$closed_tokens"
+    [ -n "$already" ] && continue
+    open_unclosed="$open_unclosed $(git -C "$ROOT" rev-parse --short "$rf")"
+  done
+  if [ -n "$open_unclosed" ]; then
+    echo "⚠️  UNCLOSED ASK —$open_unclosed"
+    echo "    Your refs: cite ask(s) addressed to '$channel' that your re: does NOT close, so they"
+    echo "    stay OPEN in 'ch open' even if this message answers them. refs: means 'builds on',"
+    echo "    not 'answers'. If this IS the reply, add them: re: [$(echo "$open_unclosed" | tr ' ' ',' | sed 's/^,//')]"
+  fi
+
+  local from subs
+  from="$(field from)"; from="${from:-$channel}"
+  subs="$(grep -m1 '^subscribers:' "$ROOT/$rel/MESSAGE.md" | cut -d: -f2- | tr -d '[]"'"'"' ' || true)"
+
+  # ── strict addressing ────────────────────────────────────────────────────────
+  # subscribers: is WHO MUST ACT, not who might be interested. The writer drowned in 112
+  # messages — zero broadcasts, ALL explicitly addressed to it, 93 of them as one of THREE
+  # recipients. Agents habitually CC the writer (and each other) on wide lists. FYI belongs in
+  # the LEDGER and the HANDOFF, which every lane already reads; a CC does not.
+  local n_sub; n_sub="$(echo "$subs" | tr ',' ' ' | wc -w | tr -d ' ')"
+  if [ -z "$subs" ]; then
+    # Empty = "deliver to every subscriber." That is a blanket broadcast, and it must be a
+    # DELIBERATE act, never the lazy default. Refuse it; name who must act (all of them, if it
+    # truly is all-hands).
+    die "subscribers: is empty — name who must ACT on this. There is no silent all-broadcast. For a genuine all-hands, list every lane explicitly."
+  elif [ "$n_sub" -ge 3 ]; then
+    echo "⚠️  WIDE ADDRESSING — this message is addressed to $n_sub lanes ($subs)."
+    echo "    subscribers: is WHO MUST ACT, not who is interested. Everyone you CC learns to skim."
+    echo "    If a lane only needs to KNOW, leave it off — the ledger and handoffs are where FYI"
+    echo "    lives. A genuine all-hands (protocol / operator directive) is the only ≥3 that earns it."
+  fi
+
+  git_retry add -- "$rel"
+  git_retry commit -q -m "$channel($project): $slug — $subject$tag"
+  # Capture the sha NOW. cmd_intend/cmd_note below each commit, moving HEAD, so any later
+  # rev-parse names the intend commit instead of the message. That misfiled two of my own
+  # messages in the running log before the `re:` guard caught it (auditor 0c02a63).
+  local msg_sha; msg_sha="$(git -C "$ROOT" rev-parse --short HEAD)"
+  git -C "$ROOT" log -1 --format='sent %h  %s'
+  # Delivery is a WRITE, not something the recipient has to re-derive later. Route on the ROLE:
+  # a worker (builder#2) publishes on the builder channel, so subscribers to 'builder' receive it.
+  deliver "$msg_sha" "$(agent_role "$channel")" "$from" "$subs" "$subject$tag"
+  # The artifact landed — clear the write-ahead marker and log it, so the handoff stays true.
+  if [ "$channel" != "ops" ] && [ -f "$ROOT/$project/$channel/HANDOFF.md" ]; then
+    cmd_intend "$project" "$channel" "(nothing in flight)" >/dev/null 2>&1 || true
+    cmd_note "$project" "$channel" "sent $msg_sha: $subject" >/dev/null 2>&1 || true
+  fi
+}
+
+# ── addressing ────────────────────────────────────────────────────────────────
+# A message reaches you only if BOTH hold:
+#   1. it was published on a channel you subscribe to, AND
+#   2. its `subscribers:` list names you (an empty list = broadcast to your subs).
+# The `to:` marker in poll output shows which. This is what keeps the field honest —
+# address everyone and you are shouting, not messaging.
+
+# Emit "sha|channel|to|subject" for each message in <range> addressed to <agent>.
+addressed_msgs() { # <agent> <range> [project]
+  local agent="$1" range="$2" project="${3:-}"
+  local mysubs; mysubs=" $(subs_of "$agent") "
+  local sha path from subs subject
+  for sha in $(git -C "$ROOT" log --format=%h "$range" -- "${project:-.}" 2>/dev/null); do
+    # Only a commit that ADDS a MESSAGE.md is a message. Without --diff-filter=A, an infra
+    # commit that deletes or edits one is mistaken for a publication.
+    path="$(git -C "$ROOT" show --name-only --diff-filter=A --format= "$sha" 2>/dev/null \
+              | grep -m1 'MESSAGE\.md$' || true)"
+    [ -z "$path" ] && continue
+    local chan; chan="$(echo "$path" | awk -F/ '{print $2}')"
+    local body; body="$(git -C "$ROOT" show "$sha:$path" 2>/dev/null || true)"
+    from="$(echo "$body" | grep -m1 '^from:' | cut -d: -f2- | tr -d ' ')"
+    [ "$from" = "$agent" ] && continue                   # never my own outbox
+    # Keep the commas — they are the delimiter. Strip only brackets, quotes, spaces.
+    subs="$(echo "$body" | grep -m1 '^subscribers:' | cut -d: -f2- | tr -d '[]"'"'"' ')"
+    subject="$(git -C "$ROOT" log -1 --format=%s "$sha")"
+    local mark="you"
+    # An ask directed at my channel outranks a plain CC — it is waiting on me.
+    echo "$subject" | grep -q "\[asks $agent\]" && mark="ASKS-YOU"
+    # Named = delivered, whatever the channel. Topology only decides who a BROADCAST reaches.
+    if [ -z "$subs" ]; then
+      [[ "$mysubs" == *" $chan "* ]] && echo "$sha|$chan|broadcast|$subject"
+    elif echo ",$subs," | grep -q ",$agent,"; then
+      echo "$sha|$chan|$mark|$subject"
+    fi                                                   # else: not addressed to me — drop
+  done
+}
+
+# ── the mailbox ───────────────────────────────────────────────────────────────
+# Delivery used to be DERIVED: `poll` re-walked git log and recomputed "what is addressed to
+# me" on demand. That means an agent asleep when a message lands has no inbox — only the
+# ability to re-derive one, if it remembers to ask. Nothing is queued, so nothing can be
+# UNREAD; a message either shows up in a scan or vanishes.
+#
+# So delivery is now an ARTIFACT. The sender writes the message into each recipient's
+# mailbox, in a commit. Three states, and they only move forward:
+#
+#   UNREAD  in .mail/<agent>/inbox, never surfaced to that agent
+#   read    surfaced by `ch poll`/`ch inbox` — the agent has SEEN it, not acted on it
+#   acked   in .acks/<agent> — the agent ACTED on it (`ch ack`). Only the agent can do this.
+#
+# The inbox survives sessions, compaction, and a missed watch event, because it is a file.
+mail_inbox() { echo "$ROOT/.mail/$1/inbox"; }   # sha \t channel \t label \t subject
+mail_seen()  { echo "$ROOT/.mail/$1/seen"; }    # LEGACY read-state (still read; no longer written)
+
+# ── receipts: ONE append-only log per agent ───────────────────────────────────
+# seen/ack state used to live in two files that got rewritten and could be reverted or
+# truncated by a concurrent commit on this shared worktree, flipping messages back to UNREAD
+# (researcher eafa4ce/aa9ba88). This log is APPEND-ONLY: `receipt <agent> seen|ack <sha>` only
+# ever appends a line, never rewrites, so recreation is replay-not-zero and concurrent appends
+# (O_APPEND, small writes) do not clobber each other. Reads still fall back to the legacy files
+# (.mail/<agent>/seen, .acks/<agent>) so nothing already acked is forgotten — no migration.
+receipts_file() { echo "$ROOT/.receipts/$1"; }
+receipt_has() { # <agent> <kind> <sha>
+  grep -qxF "$2 $3" "$(receipts_file "$1")" 2>/dev/null
+}
+# Resolve a newline list of (short OR full) shas on stdin to their FULL 40-hex object names,
+# one git process for all of them. THE reason this exists: a sha is stored in the inbox at the
+# short length current at DELIVERY, but acked/seen later at the short length current THEN — and
+# git lengthens shorts as the repo grows. Every exact-string comparison across those two moments
+# silently misses once the lengths diverge (a fully-acked message reads as "unread"; researcher
+# 0d79870d — the third instance of this after 44a1032 and 0e3395f4). Resolving both sides to the
+# FULL sha before comparing is immune to length. cat-file --batch-check consumes ALL of stdin, so
+# there is no early-exit SIGPIPE (unlike `... | grep -q`, which broke the guard the same way).
+resolve_full() { git -C "$ROOT" cat-file --batch-check='%(objectname)' 2>/dev/null | grep -Eo '^[0-9a-f]{40}' || true; }
+receipt_add() { # <agent> <kind> <sha>  — append only; caller commits once per batch
+  receipt_has "$1" "$2" "$3" && return 0
+  mkdir -p "$ROOT/.receipts"
+  printf '%s %s\n' "$2" "$3" >> "$(receipts_file "$1")"
+}
+receipt_commit() { # <agent>  — persist the log (best-effort; the append is the durable part)
+  git_retry add -- ".receipts/$1" 2>/dev/null || true
+  git -C "$ROOT" diff --cached --quiet -- ".receipts/$1" 2>/dev/null || \
+    git_retry commit -q -m "receipts($1): updated" 2>/dev/null || true
+}
+# The set of shas this agent has ACKED, from BOTH the log and the legacy file (for callers that
+# need the whole set at once, e.g. the board's unread count).
+acked_set() { # <agent>  — prints one acked sha per line
+  { grep '^ack ' "$(receipts_file "$1")" 2>/dev/null | awk '{print $2}'
+    cat "$ROOT/.acks/$1" 2>/dev/null; } | sort -u
+}
+
+# Who does a message on <channel> with <subscribers> actually reach? Never the sender.
+#
+# NAMING SOMEONE DELIVERS TO THEM. Full stop. Channel subscription only governs BROADCAST
+# fan-out (an empty subscribers: list). The old rule required both — addressed AND following
+# the channel — so builder's `[asks writer]` was dropped on the floor, because the writer
+# does not follow the builder channel. It sat in `ch open` as an outstanding ask aimed at an
+# agent structurally unable to receive it. If you address someone, they hear you.
+recipients_of() { # <channel> <from> <subs-csv>  → who actually receives this
+  # Iterate every identity that has come online (base roles + sub-instances), not the static
+  # AGENTS list, so a directly-addressed sub-instance (subscribers: [builder#2]) is reachable.
+  # LEADER/WORKER model: a role-addressed message (subscribers: [builder]) lands on the LEADER
+  # (the base instance) EXACTLY as before — there is NO fan-out to workers. The leader owns
+  # role-directed traffic and DISTRIBUTES it; workers get their slices by being named explicitly
+  # (subscribers: [builder#2]) and report back to the leader (subscribers: [builder]). This is
+  # why coexisting instances all subscribe to the role channel (see ch join): so leader↔worker
+  # messages, which ride the role channel, actually deliver.
+  local chan="$1" from="$2" subs="$3" a
+  for a in $(online_agents); do
+    [ "$a" = "$from" ] && continue
+    subscribed_to "$a" "$chan" || continue        # not subscribed = not delivered. Period.
+    if [ -z "$subs" ]; then echo "$a"             # broadcast to the channel's subscribers
+    elif echo ",$subs," | grep -q ",$a,"; then echo "$a"; fi   # named exactly (role OR instance)
+  done
+}
+
+# Named in subscribers: but NOT subscribed to this channel. The message does not reach them.
+# Saying nothing is what let builder's `[asks writer]` sit in `ch open` for a day as an ask
+# aimed at someone who could not receive it. An undeliverable address is an ERROR, loudly.
+undeliverable() { # <channel> <from> <subs-csv>
+  local chan="$1" from="$2" subs="$3" a
+  [ -z "$subs" ] && return 0
+  for a in "${AGENTS[@]}"; do
+    [ "$a" = "$from" ] && continue
+    echo ",$subs," | grep -q ",$a," || continue
+    subscribed_to "$a" "$chan" || echo "$a"
+  done
+}
+
+ensure_mail() { # <agent> — a mailbox starts EMPTY.
+  # It is NOT backfilled from git history. A message published while you were not subscribed
+  # was never delivered to you, and inventing it later fabricates a subscription that never
+  # happened — which is how an agent that has never once come online ends up with 51 unread.
+  # Create each file ONLY if absent, and NEVER couple them. The old form —
+  # `[ -f box ] && return; : > box; : > seen` — truncated SEEN whenever the INBOX was missing.
+  # On a shared worktree a concurrent commit can transiently revert one file and not the other,
+  # so an absent inbox would wipe a surviving seen and every message flips back to UNREAD
+  # (researcher eafa4ce). Truncating a file you did not mean to create is the loss.
+  local agent="$1" box seen; box="$(mail_inbox "$agent")"; seen="$(mail_seen "$agent")"
+  mkdir -p "$(dirname "$box")"
+  [ -f "$box" ]  || : > "$box"
+  [ -f "$seen" ] || : > "$seen"
+  return 0
+}
+
+# Called by `ch send` once the message commit exists. This is the delivery.
+deliver() { # <sha> <channel> <from> <subs-csv> <subject>
+  local sha="$1" chan="$2" from="$3" subs="$4"; shift 4
+  local subject="$*" a label got=""
+  for a in $(recipients_of "$chan" "$from" "$subs"); do
+    ensure_mail "$a"
+    local box; box="$(mail_inbox "$a")"
+    got="$got $a"
+    grep -q "^$sha	" "$box" 2>/dev/null && continue
+    label="you"
+    echo "$subject" | grep -q "\[asks $a\]" && label="ASKS-YOU"
+    [ -z "$subs" ] && label="broadcast"
+    printf '%s\t%s\t%s\t%s\n' "$sha" "$chan" "$label" "$subject" >> "$box"
+  done
+  if [ -n "$got" ]; then
+    # Several agent sessions commit into this worktree at once. A concurrent commit can sweep
+    # our staged inbox lines in before we get here, or hold index.lock while we try. Either is
+    # FINE — the inbox line is written either way. What is not fine is retrying a no-op commit
+    # five times and shouting. Best-effort commit, never fatal.
+    git -C "$ROOT" add -- ".mail" 2>/dev/null || true
+    if ! git -C "$ROOT" diff --cached --quiet -- ".mail" 2>/dev/null; then
+      git -C "$ROOT" commit -q -m "mail: deliver $sha →$(echo "$got" | tr ' ' ',' | sed 's/^,//')" 2>/dev/null \
+        || echo "  (delivery written; commit deferred to a concurrent session)"
+    fi
+    echo "delivered to:$got"
+  else
+    echo "delivered to: NOBODY — nobody subscribed to '$chan' is named in subscribers:"
+  fi
+  local dead; dead="$(undeliverable "$chan" "$from" "$subs" | tr '\n' ' ')"
+  if [ -n "$dead" ]; then
+    echo "  ⚠️  UNDELIVERABLE: you addressed [$dead] but they do not subscribe to '$chan',"
+    echo "      so they did NOT receive this. Either they subscribe (ch subscribe <agent> $chan)"
+    echo "      or you reach them another way. Do not assume this message landed."
+  fi
+}
+
+# Read-state: the append-only log OR the legacy seen file (backward compat).
+seen_by() { # <agent> <sha> — drift-proof: exact match first, then full-sha compare
+  receipt_has "$1" seen "$2" && return 0
+  grep -qx "$2" "$(mail_seen "$1")" 2>/dev/null && return 0
+  local full; full="$(git -C "$ROOT" rev-parse "$2" 2>/dev/null)" || return 1
+  local sset; sset="$( { grep '^seen ' "$(receipts_file "$1")" 2>/dev/null | awk '{print $2}'; \
+                         cat "$(mail_seen "$1")" 2>/dev/null; } | resolve_full)"
+  grep -qxF "$full" <<< "$sset"
+}
+
+# Mark messages as SURFACED. This is unread → read. It is NOT an ack: it records that the
+# agent was shown the message, not that it did anything about it. Keeping those separate is
+# the whole point — the old cursor conflated them and silently dropped work.
+mark_seen() { # <agent> <sha>...
+  local agent="$1"; shift
+  local sha new=0
+  for sha in "$@"; do
+    seen_by "$agent" "$sha" && continue
+    receipt_add "$agent" seen "$sha"; new=1        # append-only, never rewrite
+  done
+  [ "$new" -eq 1 ] || return 0
+  receipt_commit "$agent"
+}
+
+in_project() { # <sha> <project> — is this delivered message part of <project>?
+  # The bug this replaces: the filter matched "($project)" against the STORED subject, which is
+  # the bare subject line and has never contained the project. So `ch watch <you> <project>` —
+  # the invocation the SKILL tells every agent to use — silently emitted NOTHING, ever. Five live
+  # watch processes, all no-ops, all looking healthy. The project lives in the COMMIT subject
+  # ("builder(hids-research): ..."), so read it from there.
+  #
+  # FAIL-OPEN, deliberately. If the sha cannot be resolved, SURFACE the message. A filter that
+  # cannot identify a message must not swallow it: an over-notified agent is annoyed, an
+  # under-notified one is silently unreachable, and this bus has now paid for that twice.
+  local sha="$1" project="${2:-}"
+  [ -z "$project" ] && return 0
+  local csub; csub="$(git -C "$ROOT" log -1 --format=%s "$sha" 2>/dev/null || true)"
+  [ -z "$csub" ] && return 0
+  case "$csub" in *"($project):"*) return 0 ;; esac
+  return 1
+}
+
+cmd_catchup() { # ch catchup <agent> [project] — HISTORY addressed to you from before you subscribed.
+  # The gap the builder found (5cda0e5): mailboxes are never backfilled, deliberately — a
+  # subscription is an event, and inventing unreads for an agent that was never listening is a
+  # lie about who agreed to hear what. But an agent STAFFED LATE (the writer) then comes online
+  # to an empty box while a year of mail sits addressed to it in git, unreachable.
+  #
+  # So: this is READ-ONLY. It writes nothing to .mail, creates no unreads, changes no state. It
+  # is a history query — the archive, not the inbox — and it says so, because an agent that
+  # mistakes history for mail will "reply" to a message everyone else closed months ago.
+  local agent="$1" project="${2:-}"
+  echo "════ CATCHUP: $agent — HISTORY, NOT MAIL ════"
+  echo "These messages NAMED you but were published before you subscribed, so they were never"
+  echo "delivered and are NOT in your mailbox. Read them as the archive. Check 'ch open' before"
+  echo "replying to any of them: most are long closed."
+  echo
+  local sha path body from subs subject n=0
+  for sha in $(git -C "$ROOT" log --reverse --format=%h -- "${project:-.}" 2>/dev/null); do
+    path="$(git -C "$ROOT" show --name-only --diff-filter=A --format= "$sha" 2>/dev/null \
+              | grep -m1 'MESSAGE\.md$' || true)"
+    [ -z "$path" ] && continue
+    body="$(git -C "$ROOT" show "$sha:$path" 2>/dev/null || true)"
+    from="$(echo "$body" | grep -m1 '^from:' | cut -d: -f2- | tr -d ' ')"
+    [ "$from" = "$agent" ] && continue                      # my own outbox is not catchup
+    subs="$(echo "$body" | grep -m1 '^subscribers:' | cut -d: -f2- | tr -d '[]"'"'"' ')"
+    # NAMED only. A broadcast is not "addressed to you" if you were not listening — that is the
+    # whole point of subscription-as-event, and catchup must not smuggle it back in.
+    echo ",$subs," | grep -q ",$agent," || continue
+    in_mailbox "$agent" "$sha" && continue                  # already really delivered — not history
+    subject="$(git -C "$ROOT" log -1 --format=%s "$sha")"
+    printf '  %-8s %-10s %s\n' "$sha" "$from" "$subject"
+    n=$((n+1))
+  done
+  echo
+  echo "  ── $n message(s) in the archive addressed to you, 0 delivered (correct: you were not subscribed)."
+  [ "$n" -eq 0 ] && echo "  Nothing was ever addressed to you before you came online."
+  return 0
+}
+
+in_mailbox() { # <agent> <sha> — is this sha really in the mailbox (i.e. genuinely delivered)?
+  local f; f="$(mail_inbox "$1")"
+  [ -f "$f" ] || return 1
+  cut -f1 "$f" | grep -qx "$2"
+}
+
+cmd_inbox() { # ch inbox <agent> [project] — the mailbox. Does NOT change state.
+  local agent="$1" project="${2:-}"
+  ensure_acks "$agent"; ensure_mail "$agent"
+  skill_warn "$agent"
+  local sha chan label subject unread=0 read=0 asks=0
+  echo "════ MAILBOX: $agent ════"
+  while IFS=$'\t' read -r sha chan label subject; do
+    [ -z "$sha" ] && continue
+    in_project "$sha" "$project" || continue
+    acked "$agent" "$sha" && continue                     # done with it
+    local state="UNREAD"
+    seen_by "$agent" "$sha" && state="read  "
+    [ "$state" = "UNREAD" ] && unread=$((unread+1)) || read=$((read+1))
+    [ "$label" = "ASKS-YOU" ] && asks=$((asks+1))
+    printf '  [%s] %-8s %-10s %-9s %s\n' "$state" "$sha" "$chan" "$label" "$subject"
+  done < "$(mail_inbox "$agent")"
+  printf '  ── %d unread, %d read-but-unacked' "$unread" "$read"
+  [ "$asks" -gt 0 ] && printf ', %d WAITING ON A REPLY FROM YOU' "$asks"
+  printf '\n'
+  [ $((unread+read)) -eq 0 ] && echo "  (mailbox empty — nothing addressed to you is outstanding)"
+  return 0
+}
+
+# ── read receipts ─────────────────────────────────────────────────────────────
+# .acks/<agent> is an append-only list of message SHAs that agent has RECEIVED AND ACTED ON.
+# This replaces the old single-SHA cursor, which meant "mark everything read" — an agent
+# that handled 1 of 3 messages and advanced its cursor silently lost the other 2, forever.
+# An ack is per-message, so dropping one is now impossible by accident, and a sender can
+# check whether its message actually landed (`ch acks <sha>`).
+
+# One-time migration: an agent with a legacy cursor and no acks file has, by the old
+# semantics, "read" everything up to that cursor. Record that, so it isn't re-shown.
+ensure_acks() { # <agent>
+  local agent="$1" afile="$ROOT/.acks/$agent" cfile="$ROOT/.cursors/$agent"
+  [ -f "$afile" ] && return 0
+  mkdir -p "$ROOT/.acks"; : > "$afile"
+  if [ -f "$cfile" ]; then
+    local cursor; cursor="$(tr -d '[:space:]' < "$cfile")"
+    if git -C "$ROOT" cat-file -e "$cursor^{commit}" 2>/dev/null; then
+      addressed_msgs "$agent" "$cursor" "" | cut -d'|' -f1 >> "$afile" || true
+    fi
+  fi
+}
+
+acked() { # <agent> <sha> → 0 if already acked. Drift-proof: exact match first, then full-sha.
+  receipt_has "$1" ack "$2" && return 0
+  grep -qxF "$2" "$ROOT/.acks/$1" 2>/dev/null && return 0
+  local full; full="$(git -C "$ROOT" rev-parse "$2" 2>/dev/null)" || return 1
+  local aset; aset="$(acked_set "$1" | resolve_full)"
+  grep -qxF "$full" <<< "$aset"
+}
+
+cmd_poll() { # ch poll <agent> [project] — unacked mail, straight from the mailbox
+  local agent="$1" project="${2:-}"
+  ensure_acks "$agent"; ensure_mail "$agent"
+  local sha chan label subject found=0 fresh=()
+  while IFS=$'\t' read -r sha chan label subject; do
+    [ -z "$sha" ] && continue
+    in_project "$sha" "$project" || continue
+    acked "$agent" "$sha" && continue
+    local state="UNREAD"
+    if seen_by "$agent" "$sha"; then state="read  "; else fresh+=("$sha"); fi
+    printf '  [%s] %-8s %-10s → %-9s %s\n' "$state" "$sha" "$chan" "$label" "$subject"
+    found=1
+  done < "$(mail_inbox "$agent")"
+  if [ "$found" -eq 0 ]; then
+    echo "nothing unacked for $agent"
+  else
+    echo "  ── ack each one AFTER you act on it:  ch ack $agent <sha>"
+  fi
+  # Surfacing them here is what makes them 'read'. Acking is still yours alone to do.
+  [ ${#fresh[@]} -gt 0 ] && mark_seen "$agent" "${fresh[@]}"
+  return 0
+}
+
+cmd_ack() { # ch ack <agent> <sha> [sha...] — read receipt, one message at a time
+  local agent="$1"; shift
+  [ $# -gt 0 ] || die "ack needs at least one message SHA"
+  ensure_acks "$agent"
+  local sha short
+  for sha in "$@"; do
+    short="$(git -C "$ROOT" rev-parse --short "$sha" 2>/dev/null)" || die "unknown commit: $sha"
+    acked "$agent" "$short" && { echo "already acked: $short"; continue; }
+    receipt_add "$agent" ack "$short"              # append-only, never rewrite
+    echo "acked $short"
+  done
+  receipt_commit "$agent"
+}
+
+cmd_acks() { # ch acks <sha> — WHO has received this message? the read receipt, read back.
+  local sha short; short="$(git -C "$ROOT" rev-parse --short "$1")" || die "unknown commit: $1"
+  echo "$(git -C "$ROOT" log -1 --format='%h %s' "$short")"
+  local a seen=""
+  for a in "${AGENTS[@]}"; do
+    acked "$a" "$short" && seen="$seen $a"
+  done
+  # who SHOULD have seen it
+  local path body subs
+  path="$(git -C "$ROOT" show --name-only --format= "$short" | grep -m1 'MESSAGE\.md$' || true)"
+  if [ -n "$path" ]; then
+    body="$(git -C "$ROOT" show "$short:$path")"
+    subs="$(echo "$body" | grep -m1 '^subscribers:' | cut -d: -f2- | tr -d '[]"'"'"' ' | tr ',' ' ')"
+    echo "  addressed to: ${subs:-<broadcast>}"
+  fi
+  echo "  read by:     ${seen:-<nobody yet>}"
+  local pending="" a2
+  for a2 in $subs; do acked "$a2" "$short" || pending="$pending $a2"; done
+  [ -n "$pending" ] && echo "  NOT read by:$pending"
+  return 0
+}
+
+# ── waking ────────────────────────────────────────────────────────────────────
+# The pidfile reap assumes ONE SESSION per agent. When two LIVE sessions run as the same agent
+# (e.g. an operator-attached session AND a bg-spare post-compaction renewal — auditor a8c87d09),
+# each session's re-arm looks to the other like an external reap, and they alternately SIGTERM each
+# other's watch forever. So before reaping, distinguish a DEAD-session orphan (reap — that is the
+# whole point of the pidfile) from a LIVE PEER (a concurrent session for the same agent — do NOT
+# reap; that is the war). The tell: an orphaned watch was reparented to init (PPID 1) when its
+# session died; a live peer's watch still has a live parent. The deeper hazard a peer signals is
+# not the watch churn — it is two sessions clobbering one HANDOFF.md and racing verdicts/acks.
+live_peer_watch() { # <agent> — pid of a LIVE peer session's watch (alive, live parent, not us); else empty
+  local pidf="$ROOT/.watch/$1.pid"
+  [ -f "$pidf" ] || return 0
+  local old; old="$(cat "$pidf" 2>/dev/null)"
+  [ -n "$old" ] && [ "$old" != "$$" ] && kill -0 "$old" 2>/dev/null || return 0
+  local oppid; oppid="$(ps -o ppid= -p "$old" 2>/dev/null | tr -d ' ')"
+  [ "$oppid" = "1" ] && return 0        # orphan (session died) — reapable, not a live peer
+  echo "$old"                            # alive with a live parent (or ppid unknown) — treat as peer
+}
+# Session identity for a held watch slot. CLAUDE_CODE_SESSION_ID is exported into every shell a
+# Claude Code session spawns, so recording it beside the pidfile lets a later command distinguish
+# "my own watch from earlier in this session" (re-arm/resume: fine) from "a RIVAL session's watch"
+# (a second REPLACE flow against one standdown — the builder dual-leader conflict, d77075b0).
+watch_sid() { cat "$ROOT/.watch/$1.sid" 2>/dev/null; }
+same_watch_session() { # <agent> — 0 iff the live watch for <agent> belongs to THIS session
+  [ -n "${CLAUDE_CODE_SESSION_ID:-}" ] || return 1
+  [ "$(watch_sid "$1")" = "$CLAUDE_CODE_SESSION_ID" ]
+}
+
+cmd_watch() { # ch watch <agent> [project] — one line per NEW message landing in your mailbox.
+  # Tails the mailbox FILE, not git log. A missed tick is now survivable: the inbox is on
+  # disk, so anything this stream fails to announce is still sitting there UNREAD.
+  local agent="$1" project="${2:-}" interval="${CH_WATCH_INTERVAL:-20}"
+  ensure_mail "$agent"
+  local pidf="$ROOT/.watch/$agent.pid"
+  mkdir -p "$ROOT/.watch"
+  # If a LIVE peer session already holds this agent's watch, do NOT reap it (that starts the war).
+  # Refuse to arm a second watch and say why — the duplicate session learns it IS a duplicate.
+  local peer; peer="$(live_peer_watch "$agent")"
+  if [ -n "$peer" ] && same_watch_session "$agent"; then
+    # Our OWN earlier watch (same CLAUDE_CODE_SESSION_ID) — a re-arm after TaskStop/compaction,
+    # not a rival. Reap it and take the slot.
+    kill "$peer" 2>/dev/null || true
+    peer=""
+  fi
+  if [ -n "$peer" ]; then
+    echo "⚠️  another LIVE $agent session already holds the watch (pid $peer${CLAUDE_CODE_SESSION_ID:+, session $(watch_sid "$agent" | cut -c1-8)})." >&2
+    echo "    You are a DUPLICATE session for '$agent'. NOT arming a second watch — two sessions" >&2
+    echo "    as one agent clobber each other's HANDOFF.md and RACE verdicts/acks; the watch is the" >&2
+    echo "    least of it. Resolve with the operator: close one session. If YOU are the intended" >&2
+    echo "    replacement, stop the other session first, then re-run 'ch watch $agent'. Mail is" >&2
+    echo "    durable regardless — the surviving watch covers wake-ups, nothing is lost." >&2
+    return 3
+  fi
+  # EXACTLY ONE watch per agent. A watch is a detached shell that OUTLIVES the session that armed it
+  # — session ends, the loop keeps running, and the next session arms another. They pile up (23
+  # processes for 5 agents once, most dead builds tailing an inbox nobody reads). A lane then looks
+  # watched while its only LIVE watch is dead. Reaching here, any watch in the pidfile is an ORPHAN
+  # (the live-peer case was already excluded above), so reaping it is safe. One agent, one wake.
+  if [ -f "$pidf" ]; then
+    local old; old="$(cat "$pidf" 2>/dev/null)"
+    if [ -n "$old" ] && [ "$old" != "$$" ] && kill -0 "$old" 2>/dev/null; then
+      kill "$old" 2>/dev/null || true                       # orphaned watch for THIS agent — gone
+    fi
+  fi
+  echo "$$" > "$pidf"
+  local sidf="$ROOT/.watch/$agent.sid"
+  if [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then echo "$CLAUDE_CODE_SESSION_ID" > "$sidf"; else rm -f "$sidf"; fi
+  rm -f "$ROOT/.watch/$agent.joining" 2>/dev/null || true   # watch armed = join handshake complete
+  # Self-cleanup: drop the pidfile if it still points at us when we exit. The INT/TERM traps
+  # must EXIT — a signal trap that only runs a handler and returns makes the process IGNORE the
+  # kill, so the reap above would fire and the old watch would shrug it off and keep tailing.
+  trap 'if [ "$(cat "$pidf" 2>/dev/null)" = "$$" ]; then rm -f "$pidf" "$sidf"; fi' EXIT
+  trap 'exit 143' TERM
+  trap 'exit 130' INT
+  local box; box="$(mail_inbox "$agent")"
+  local n; n="$(wc -l < "$box" | tr -d ' ')"
+  # A protocol change is an EVENT, not something an agent finds out at its next session start.
+  # A live agent can run for hours on a skill that changed under it — that is how `ch catchup`
+  # shipped to a bus where nobody knew it existed. Announce it once, on the wire, immediately.
+  # Track the currency VERSION, not the raw file hash: a MINOR bump (typo/threshold) must NOT wake
+  # every lane with a mandatory-reload event. Only a MAJOR bump (VERSION advances) fires here.
+  local sk_last; sk_last="$(skill_version)"
+  while true; do
+    sleep "$interval"
+    local sk_now; sk_now="$(skill_version)"
+    if [ -n "$sk_now" ] && [ "$sk_now" != "$sk_last" ]; then
+      echo "[SKILL CHANGED] $(skill_note) — RELOAD the 'channels' skill, then: ch skill-ack <you>"
+      sk_last="$sk_now"
+    fi
+    local now; now="$(wc -l < "$box" 2>/dev/null | tr -d ' ')"
+    [ -z "$now" ] && continue
+    if [ "$now" -gt "$n" ]; then
+      local sha chan label subject
+      while IFS=$'\t' read -r sha chan label subject; do
+        [ -z "$sha" ] && continue
+        in_project "$sha" "$project" || continue
+        echo "[$chan → $label] $sha $subject"
+      done < <(tail -n "+$((n+1))" "$box")
+      n="$now"
+    elif [ "$now" -lt "$n" ]; then
+      n="$now"                                            # inbox rewritten under us; resync
+    fi
+  done
+}
+
+# Is an ask/promise CLOSED? Its sha (from `git log %h`) may have GROWN to 8 chars as the repo
+# grew, while the closing tag [re <sha>]/[resolves <sha>] stored the 7-char short that was
+# current when it was WRITTEN. A naive `grep "^$sha"` (current fixed-length vs a shorter stored
+# token) then MISSES — the ask falsely reads OPEN, inflating every lane's backlog (auditor
+# 930c72e0: asks-waiting:42 with an empty mailbox). Resolve the candidate to its FULL sha and
+# test whether any closing token is a PREFIX of it; a prefix match is immune to either side's
+# length.
+sha_closed_by() { # $1 = ask/promise sha (short or full); $2 = newline list of closing tokens
+  local full tok; full="$(git -C "$ROOT" rev-parse "$1" 2>/dev/null)" || return 1
+  while IFS= read -r tok; do
+    [ -n "$tok" ] || continue
+    case "$full" in "$tok"*) return 0 ;; esac
+  done <<< "$2"
+  return 1
+}
+
+# ── pod registry ──────────────────────────────────────────────────────────────
+# A RunPod pod is billed by the hour whether or not it is doing work, and a pod left
+# running unwatched is money burning with nobody looking. So a running pod is STORED state
+# on the bus, exactly like a mailbox — registered when you launch it, cleared when you stop
+# it — not something inferred from free-form handoff text. `ch pods` is then the shared-account
+# view ("who has a pod up right now"), and `ch board` flags a registered pod whose owning lane
+# has gone silent (an ABANDONED POD). Full monitoring discipline lives in the runpod-ops skill.
+pod_dir() { echo "$ROOT/.pods/$1"; }
+cmd_pod_up() { # ch pod-up <agent> <podId> [--monitor <taskid>] [--eta <hours>] [note] — register a running pod
+  local agent="${1:-}" pod="${2:-}"; shift 2 2>/dev/null || true
+  [ -n "$agent" ] && [ -n "$pod" ] || die "usage: ch pod-up <agent> <podId> [--monitor <taskid>] [--eta <hours>] [note]"
+  is_agent "$agent" || die "unknown agent: $agent"
+  local monitor="" eta="" note=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --monitor) monitor="${2:-}"; shift 2 ;;
+      --eta)     eta="${2:-}"; shift 2 ;;      # declared expected runtime in HOURS — the pod's own budget
+      *) note="$note${note:+ }$1"; shift ;;
+    esac
+  done
+  mkdir -p "$(pod_dir "$agent")"
+  local f; f="$(pod_dir "$agent")/$pod"
+  printf 'launched=%s\nmonitor=%s\neta_h=%s\nnote=%s\n' "$(date +%s)" "$monitor" "$eta" "$note" > "$f"
+  git_retry add -- ".pods/$agent/$pod" >/dev/null 2>&1 || true
+  git -C "$ROOT" diff --cached --quiet -- ".pods/$agent/$pod" 2>/dev/null || \
+    git_retry commit -q -m "pod($agent): up $pod${monitor:+ [mon $monitor]}${eta:+ [eta ${eta}h]}${note:+ — $note}" >/dev/null 2>&1 || true
+  echo "registered pod $pod for $agent${monitor:+ (monitor $monitor)}${eta:+, eta ${eta}h}. Announce it on the bus; 'ch pod-down $agent $pod' the instant it stops."
+  [ -z "$monitor" ] && echo "  ⚠️  no --monitor <taskid> recorded — the board will mark this pod BARE (silent-death risk). Arm a persistent monitor, then re-run with --monitor <taskid>."
+  [ -z "$eta" ] && echo "  ℹ️  no --eta <hours> declared — 'ch spend' and the board can't flag this pod when it bills past its own plan. Optional, but it makes the over-budget check precise."
+}
+cmd_pod_down() { # ch pod-down <agent> <podId> — deregister a stopped/terminated pod
+  local agent="${1:-}" pod="${2:-}"
+  [ -n "$agent" ] && [ -n "$pod" ] || die "usage: ch pod-down <agent> <podId>"
+  local f; f="$(pod_dir "$agent")/$pod"
+  [ -f "$f" ] || { echo "no such registered pod: $agent/$pod (already down?)"; return 0; }
+  git_retry rm -q -- ".pods/$agent/$pod" >/dev/null 2>&1 || rm -f "$f"
+  git -C "$ROOT" diff --cached --quiet -- ".pods/$agent/$pod" 2>/dev/null || \
+    git_retry commit -q -m "pod($agent): down $pod" >/dev/null 2>&1 || true
+  echo "deregistered pod $pod for $agent. Confirm zero pods remain: ch pods"
+}
+cmd_pods() { # ch pods — every registered running pod across all lanes (the shared-account view)
+  local now; now="$(date +%s)"
+  local any=0 a f pod launched monitor note up mon
+  echo "════ PODS (registered running) ════"
+  for a in $(board_agents); do
+    [ -d "$(pod_dir "$a")" ] || continue
+    for f in "$(pod_dir "$a")"/*; do
+      [ -e "$f" ] || continue
+      pod="$(basename "$f")"
+      launched="$(grep -m1 '^launched=' "$f" | cut -d= -f2-)"
+      monitor="$(grep -m1 '^monitor=' "$f" | cut -d= -f2-)"
+      note="$(grep -m1 '^note=' "$f" | cut -d= -f2-)"
+      up="?"; [ -n "$launched" ] && up="$(( (now - launched) / 60 ))m"
+      mon="${monitor:-⚠BARE}"
+      printf '  %-11s pod:%-16s up:%-7s mon:%-14s %s\n' "$a" "$pod" "$up" "$mon" "${note:+— $note}"
+      any=1
+    done
+  done
+  [ "$any" -eq 0 ] && echo "  (no pods registered running — the account should be empty; verify with the RunPod API)"
+  return 0
+}
+
+# Pod provisioning is CENTRALIZED to tech-support (operator directive 2026-07-18, relayed by the
+# researcher, ref 1ab0e75f): only tech-support runs pod-create / pod-terminate. Any other lane that
+# needs compute files a POD REQUEST — an `asks: tech-support` message carrying the full preflight
+# bundle — and tech-support provisions ONLY against a complete bundle, then hands back SSH. This
+# scaffolds that message with the required fields so a lane cannot forget one.
+cmd_pod_request() { # ch pod-request <project> <lane> <slug> — scaffold a preflight bundle addressed to tech-support
+  local project="${1:-}" lane="${2:-}" slug="${3:-}"
+  [ -n "$project" ] && [ -n "$lane" ] && [ -n "$slug" ] || die "usage: ch pod-request <project> <lane> <slug>"
+  is_agent "$lane" || die "unknown lane: $lane"
+  cmd_intend "$project" "$lane" "pod-request '$slug': asking tech-support to provision a pod (preflight bundle attached)" >/dev/null || true
+  local dir="$ROOT/$project/$lane/$(today)-$slug"
+  [ -e "$dir/MESSAGE.md" ] && die "message already exists: $dir/MESSAGE.md (append-only — pick a new slug)"
+  mkdir -p "$dir"
+  cat > "$dir/MESSAGE.md" <<EOF
+---
+from: $lane
+project: $project
+date: $(today)
+subscribers: [tech-support]
+status: open
+asks: tech-support
+re: null
+promises: null
+resolves: null
+refs: []
+---
+
+# POD REQUEST: <one line — what the job is and the box you need>
+
+## What happened
+Requesting tech-support to provision a pod (only tech-support may launch, per operator directive
+1ab0e75f). I own the workload once you hand me the box; I will NOT terminate — I notify you when
+artifacts are pulled+verified and you tear it down.
+
+## Preflight bundle (tech-support provisions ONLY against a complete one)
+- **Job:** <what runs>
+- **Bottleneck resource:** <GPU-compute | GPU-VRAM | CPU | system-RAM | disk> — <why this is the bottleneck>
+- **CPU / system RAM:** <est peak RSS> — gate: cgroup \`/sys/fs/cgroup/memory.max\` >= <N> GB (read the CGROUP file, NOT /proc/meminfo)
+- **GPU VRAM:** <est peak GB, or "none — CPU-only job"> — the GPU memory the model+batch actually need
+- **GPU compute:** <which GPU + why, or "none — CPU/RAM-bound, use a CPU box"> (name the GPU ONLY if GPU-compute is the bottleneck; a RAM need does NOT justify a GPU box — that conflation is the 8×A100 fiasco)
+- **Box spec:** <e.g. 1x A100 PCIe / 1x4090 / high-RAM CPU box / N vCPU + M GB system RAM>
+- **Gates:** <data-presence, disk, CUDA op, whatever must pass before the real run>
+- **Smoke command + evidence:** <2-min exact command incl. scoring; paste the smoke result>
+- **ETA:** <hours>   **Projected cost:** <\$/hr × ETA = \$total> (the box \$/hr must sit under the \$1.50/hr account cap; over it is hard-blocked and needs David to raise the cap)
+
+## What I need next
+tech-support: verify the box (cgroup read, nvidia-smi if GPU, disk), provision, register it
+(pod-up --monitor --eta), hand me SSH. Asks: tech-support.
+EOF
+  echo "$dir/MESSAGE.md"
+  echo "  (fill the bundle, then: ch send $project $lane $slug \"<subject>\")"
+}
+
+# ── spend telemetry / runaway-spend guard ─────────────────────────────────────
+# The balance AUTO-RECHARGES (operator directive via researcher 74c334ed), so there is no wall to
+# stop a forgotten pod — it bills forever with nothing to backstop it. The discipline is therefore
+# SPEND, not runway: `ch spend` fetches per-pod cumulative cost (costPerHr × uptime) and flags the
+# three things an auto-recharge can't self-limit — a pod billing that NOBODY registered on the bus
+# (the forgotten-pod case, caught by diffing the live account against the registry), a registered
+# pod past its declared --eta, and (on the board) a pod billing while its lane went silent. Design
+# constraint unchanged: `ch board` stays OFFLINE (SessionStart-hook path, must never hang on the
+# network); `ch spend` is the ONLY thing that hits the RunPod API, writes a cache, and the board
+# reads the cache with an age. (Single-surface discipline, same lesson as 0d79870d.)
+spend_cache() { echo "$ROOT/.pods/.spend"; }
+runpod_key() { # the API key, quotes stripped (config stores it single-quoted)
+  local f="${RUNPOD_CONFIG:-$HOME/.runpod/config.toml}"
+  [ -f "$f" ] || return 1
+  grep -m1 'apikey' "$f" 2>/dev/null | sed -E "s/.*=[[:space:]]*['\"]?([^'\"]+)['\"]?.*/\1/"
+}
+registered_pod_ids() { # every podId currently registered on the bus (one per line)
+  local a f
+  for a in $(board_agents); do
+    [ -d "$(pod_dir "$a")" ] || continue
+    for f in "$(pod_dir "$a")"/*; do [ -e "$f" ] && basename "$f"; done
+  done
+}
+# ── email notifications ──────────────────────────────────────────────────────
+# A local SES sender so a bus event the OPERATOR must see reaches the operator's inbox even
+# when no Claude session is watching the terminal. Uses an SES identity you have already
+# verified (set CHANNELS_NOTIFY_FROM/TO, CHANNELS_AWS_PROFILE, CHANNELS_SES_REGION) — no new
+# AWS infra to deploy. Throttled per-key so a monitor firing every 2 minutes cannot spam identical
+# emails; the first breach mails immediately, repeats inside the window are suppressed (logged).
+notify_dir() { echo "$ROOT/.notify"; }   # local-only state (gitignored), not bus history
+cmd_notify() { # ch notify [--key <k>] [--throttle <min>] <subject> [body...]   (body from stdin if omitted)
+  local key="" throttle="${CHANNELS_NOTIFY_THROTTLE_MIN:-15}"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --key)      key="${2:-}"; shift 2 ;;
+      --throttle) throttle="${2:-15}"; shift 2 ;;
+      --) shift; break ;;
+      -*) die "ch notify: unknown flag $1" ;;
+      *) break ;;
+    esac
+  done
+  local subj="${1:-}"; [ -n "$subj" ] || die "usage: ch notify [--key k] [--throttle min] <subject> [body]"
+  shift || true
+  local body="$*"
+  if [ -z "$body" ] && [ ! -t 0 ]; then body="$(cat)"; fi
+  [ -n "$body" ] || body="$subj"
+  [ -n "$key" ] || key="$subj"
+  local from="${CHANNELS_NOTIFY_FROM:-}"
+  local to="${CHANNELS_NOTIFY_TO:-}"
+  [ -n "$from" ] && [ -n "$to" ] || die "ch notify: set CHANNELS_NOTIFY_FROM and CHANNELS_NOTIFY_TO (a verified SES identity)"
+  local profile="${CHANNELS_AWS_PROFILE:-default}"
+  local region="${CHANNELS_SES_REGION:-us-east-1}"
+  local ndir; ndir="$(notify_dir)"; mkdir -p "$ndir"
+  local log="$ndir/log"
+  # sanitize the key into a readable state-filename (no md5 dependency)
+  local kf; kf="$(printf '%s' "$key" | tr -c 'a-zA-Z0-9._-' '_' | cut -c1-64)"
+  local stamp="$ndir/$kf"
+  local now; now="$(date +%s)"
+  local ts; ts="$(date +%FT%T)"
+  if [ -f "$stamp" ] && [ "${throttle:-0}" -gt 0 ] 2>/dev/null; then
+    local last gap; last="$(cat "$stamp" 2>/dev/null || echo 0)"
+    gap=$(( (now - last) / 60 ))
+    if [ "$gap" -lt "$throttle" ]; then
+      printf '%s THROTTLED key=%s (%dm<%dm) subj=%s\n' "$ts" "$key" "$gap" "$throttle" "$subj" >> "$log"
+      echo "notify THROTTLED — '$key' last sent ${gap}m ago (< ${throttle}m); not re-sent."
+      return 0
+    fi
+  fi
+  if ! command -v aws >/dev/null 2>&1; then
+    printf '%s FAIL-NOAWS subj=%s\n' "$ts" "$subj" >> "$log"
+    echo "ch notify: aws CLI not found — email NOT sent (logged to $log)" >&2
+    return 0   # NEVER abort the caller (a monitor loop must survive a send failure)
+  fi
+  local content
+  content="$(CH_SUBJ="$subj" CH_BODY="$body" python3 -c 'import os,json; print(json.dumps({"Simple":{"Subject":{"Data":os.environ["CH_SUBJ"][:200]},"Body":{"Text":{"Data":os.environ["CH_BODY"]}}}}))' 2>/dev/null || true)"
+  if [ -z "$content" ]; then
+    printf '%s FAIL-JSON subj=%s\n' "$ts" "$subj" >> "$log"
+    echo "ch notify: could not build SES payload — email NOT sent (logged to $log)" >&2
+    return 0
+  fi
+  local mid
+  if mid="$(aws --profile "$profile" --region "$region" sesv2 send-email \
+        --from-email-address "$from" --destination "ToAddresses=$to" \
+        --content "$content" --query MessageId --output text 2>>"$log")"; then
+    echo "$now" > "$stamp"
+    printf '%s SENT key=%s mid=%s subj=%s\n' "$ts" "$key" "$mid" "$subj" >> "$log"
+    echo "notify SENT → $to (MessageId $mid)"
+  else
+    printf '%s FAIL-SES key=%s subj=%s (aws error appended above)\n' "$ts" "$key" "$subj" >> "$log"
+    echo "ch notify: SES send failed — see $log" >&2
+    return 0   # NEVER abort the caller
+  fi
+}
+
+cmd_spend() { # ch spend — per-pod cumulative $ + aggregate burn from RunPod; flag runaway spend; cache it
+  local key; key="$(runpod_key)" || die "no RunPod config ($HOME/.runpod/config.toml) — set RUNPOD_CONFIG"
+  [ -n "$key" ] || die "could not parse apikey from the RunPod config"
+  local json; json="$(curl -s "https://api.runpod.io/graphql?api_key=$key" \
+      -H 'Content-Type: application/json' \
+      -d '{"query":"query{myself{clientBalance pods{id name desiredStatus costPerHr runtime{uptimeInSeconds}}}}"}' \
+      --max-time 20 2>/dev/null)"
+  [ -n "$json" ] || die "RunPod API unreachable (no response) — leaving the last cache in place"
+  local reg; reg="$(registered_pod_ids | tr '\n' ',' )"
+  local cap="${CHANNELS_SPEND_CAP:-25}"   # per-pod cumulative-$ over this = runaway (default $25)
+  # python does the JSON + per-pod arithmetic and prints: a machine SUMMARY line, then human ROW
+  # lines. Row fields are space-delimited with the pod NAME last (it may contain spaces); no
+  # backslash appears inside any f-string field (Python <3.12 rejects that), so build tokens first.
+  local out; out="$(printf '%s' "$json" | REG="$reg" CAP="$cap" python3 -c '
+import sys, os, json
+try:
+    d = json.load(sys.stdin)["data"]["myself"]
+except Exception:
+    print("SUMMARY ERR 0 0 0 0 0"); sys.exit(0)
+reg = set(x for x in os.environ.get("REG","").split(",") if x)
+cap = float(os.environ.get("CAP") or 25)
+bal = float(d.get("clientBalance") or 0)
+pods = [p for p in (d.get("pods") or []) if p.get("desiredStatus") == "RUNNING"]
+burn = sum(float(p.get("costPerHr") or 0) for p in pods)
+total = 0.0; unreg = 0; rows = []
+for p in pods:
+    rate = float(p.get("costPerHr") or 0)
+    up = float(((p.get("runtime") or {}).get("uptimeInSeconds")) or 0) / 3600.0
+    spent = rate * up
+    total += spent
+    pid = p.get("id") or "?"
+    name = p.get("name") or "-"
+    isreg = pid in reg
+    if not isreg: unreg += 1
+    flags = []
+    if spent > cap: flags.append("OVER-CAP")
+    if not isreg: flags.append("UNREGISTERED")
+    regf = "reg" if isreg else "UNREG"
+    flagstr = "|".join(flags) if flags else "-"
+    rows.append("ROW %.2f %.2f %.1f %s %s %s %s" % (spent, rate, up, pid, regf, flagstr, name))
+print("SUMMARY OK %.2f %.2f %.2f %d %d" % (bal, burn, total, len(pods), unreg))
+for r in rows: print(r)
+' 2>/dev/null)"
+  local sline; sline="$(printf '%s\n' "$out" | grep -m1 '^SUMMARY ' || true)"
+  local _s st bal burn total run unreg; read -r _s st bal burn total run unreg <<< "$sline"
+  [ "$st" = "OK" ] || die "RunPod API returned an error or unexpected shape — cache unchanged. Raw: ${json:0:120}"
+  local now; now="$(date +%s)"
+  mkdir -p "$ROOT/.pods"
+  printf 'ts=%s\nbalance=%s\nburn=%s\ntotal_spent=%s\nrunning=%s\nunregistered=%s\n' \
+    "$now" "$bal" "$burn" "$total" "$run" "$unreg" > "$(spend_cache)"
+  git_retry add -- ".pods/.spend" >/dev/null 2>&1 || true
+  git -C "$ROOT" diff --cached --quiet -- ".pods/.spend" 2>/dev/null || \
+    git_retry commit -q -m "spend: \$$burn/hr, \$$total on $run running pod(s)${unreg:+, $unreg unregistered}" >/dev/null 2>&1 || true
+  # human output
+  printf 'spend: $%s/hr live burn · $%s cumulative on %s running pod(s) · balance $%s (auto-recharges)\n' "$burn" "$total" "$run" "$bal"
+  # HARD BURN CEILING (operator directive 2026-07-18): aggregate burn over $5/hr means a job is
+  # wrong (almost always CPU/RAM work on a GPU box) and must be REDONE right-sized, not paid for.
+  # This is the tripwire, not a suggestion — an 8xA100 rebuild burned $286/day with idle GPUs.
+  local burn_cap="${CHANNELS_BURN_CAP:-2}"
+  if awk "BEGIN{exit !(${burn:-0} > $burn_cap)}"; then
+    echo "  ⛔⛔ BURN CEILING BREACHED — \$$burn/hr EXCEEDS the \$$burn_cap/hr ceiling. Per operator rule,"
+    echo "      a job over \$$burn_cap/hr is WRONG and must be REDONE right-sized (nvidia-smi it: idle GPUs"
+    echo "      on a GPU box = the cause). Right-size or kill NOW; do not let it run."
+    # Email David directly — this must reach him even when no session is watching the terminal.
+    # Throttled (key=burn-breach) so a 120s monitor loop mails once per window, not every poll.
+    cmd_notify --key burn-breach \
+      "⛔ BURN CEILING BREACHED: \$$burn/hr (cap \$$burn_cap) on $run pod(s)" \
+      "$(printf 'Aggregate RunPod burn is $%s/hr, over the $%s/hr ceiling, on %s running pod(s).\n\nPer the operator rule a job over the ceiling is WRONG (almost always CPU/RAM work on an idle-GPU box) and must be right-sized or killed NOW, not paid for.\n\ntech-support: nvidia-smi the box; if GPUs idle, kill and redo right-sized. Run `ch spend` for the per-pod breakdown.' "$burn" "$burn_cap" "$run")" \
+      >/dev/null 2>&1 || true
+  fi
+  printf '%s\n' "$out" | grep '^ROW ' | while read -r _r spent rate up pid regf flagstr name; do
+    local mark=""; [ "$flagstr" != "-" ] && mark="  ⛔ $flagstr"
+    printf '  $%-7s $%-5s/hr  up %-7s %-16s %s%s\n' "$spent" "$rate" "${up}h" "$pid" "$name" "$mark"
+  done || true
+  # runaway summary flags
+  if [ "${unreg:-0}" -ge 1 ]; then
+    echo "  ⛔ RUNAWAY RISK — $unreg running pod(s) billing but NOT registered on the bus. With no balance wall, an unregistered pod is a forgotten pod. 'ch pod-up' them or terminate."
+  fi
+  # over-eta cross-check on REGISTERED pods (offline, from --eta) — billing past their own budget
+  local a f pod launched eta_h age_h
+  for a in $(board_agents); do
+    [ -d "$(pod_dir "$a")" ] || continue
+    for f in "$(pod_dir "$a")"/*; do
+      [ -e "$f" ] || continue
+      eta_h="$(grep -m1 '^eta_h=' "$f" | cut -d= -f2- || true)"; [ -n "$eta_h" ] || continue
+      launched="$(grep -m1 '^launched=' "$f" | cut -d= -f2-)"; [ -n "$launched" ] || continue
+      pod="$(basename "$f")"
+      age_h="$(awk "BEGIN{printf \"%.1f\", ($now-$launched)/3600}")"
+      if awk "BEGIN{exit !($age_h > $eta_h)}"; then
+        echo "  ⏰ $a/$pod is ${age_h}h in, past its declared ${eta_h}h budget — billing past plan. Confirm it's progressing or 'ch pod-down'."
+      fi
+    done
+  done
+  return 0
+}
+
+# ── stuck-monitor / stuck-command sweep ───────────────────────────────────────
+# Operator directive (2026-07-17): tech-support periodically checks for stuck monitors and shell
+# commands across the workers, and either unsticks them or escalates a judgment call to the
+# researcher. Two failure modes are reliably detectable from here (all lanes run as one user on one
+# machine, so the process table and the RunPod account are both visible):
+#   (1) an ORPHANED watch loop — a `ch watch` whose session died (reparented to PID 1) but the shell
+#       loop kept running; nothing reads its output, so it is safe to reap.
+#   (2) a STALE pod registration — a pod registered on the bus but no longer RUNNING on the account;
+#       the lane never ran `ch pod-down`, and its Monitor is probably still polling a terminated pod
+#       (runpod-ops: "Monitor loops survive compaction and poll a terminated pod forever"). This one
+#       is NOT auto-fixed — only the owning lane can TaskStop its own monitor; tech-support asks it
+#       to, or escalates to the researcher if it is unclear the pod should be down.
+# A genuinely-wedged local command (a hung python/ssh in another session) is NOT reliably separable
+# from a slow-but-progressing one from outside that session — that is a wedged-vs-slow judgment, and
+# by the wedged-vs-slow discipline + "researcher is the lead" it goes to the researcher, not a
+# unilateral kill. This sweep surfaces the two mechanical cases; the judgment cases it routes.
+cmd_stuck() { # ch stuck [--reap] — find orphaned watch loops + pods registered-but-not-running
+  local reap=0; [ "${1:-}" = "--reap" ] && reap=1
+  local found=0
+  echo "════ STUCK CHECK ════"
+  # (1) orphaned ch-watch loops (PPID=1). Bracket the pattern ([c]h) so this sweep's own ps/awk line
+  #     cannot self-match (the remote-pgrep lesson, 3c33df6f).
+  local orphans; orphans="$(ps -eo pid,ppid,etime,args 2>/dev/null | awk '/[c]h watch/ && $2==1 {print $1"|"$3"|"$(NF-1)}')"
+  if [ -n "$orphans" ]; then
+    found=1
+    echo "orphaned watch loops (session died, loop still running — safe to reap):"
+    while IFS='|' read -r pid age agent; do
+      [ -n "$pid" ] || continue
+      if [ "$reap" -eq 1 ]; then
+        kill -9 "$pid" 2>/dev/null && echo "  reaped pid $pid  ($agent, was up $age)"
+      else
+        echo "  pid $pid  ($agent, up $age)"
+      fi
+    done <<< "$orphans"
+    [ "$reap" -eq 0 ] && echo "  → 'ch stuck --reap' kills these (they poll the bus with nobody listening)"
+  fi
+  # (2) pods registered on the bus but NOT running on RunPod → the lane's monitor may be polling a
+  #     dead pod. Guard against a failed API call: python prints OK on success (even with 0 pods), so
+  #     an empty/error response is distinguishable from "nothing running" and we skip rather than
+  #     false-flag every registration.
+  local key; key="$(runpod_key 2>/dev/null || true)"
+  if [ -n "$key" ]; then
+    local resp; resp="$(curl -s "https://api.runpod.io/graphql?api_key=$key" -H 'Content-Type: application/json' \
+        -d '{"query":"query{myself{pods{id desiredStatus}}}"}' --max-time 15 2>/dev/null \
+        | python3 -c '
+import sys, json
+try:
+    pods = json.load(sys.stdin)["data"]["myself"]["pods"]
+except Exception:
+    sys.exit(0)
+print("OK")
+for p in pods:
+    if p.get("desiredStatus") == "RUNNING":
+        print(p.get("id"))
+' 2>/dev/null)"
+    if grep -qx 'OK' <<< "$resp"; then
+      local running; running="$(grep -vx 'OK' <<< "$resp" || true)"
+      local a f pod mon
+      for a in $(board_agents); do
+        [ -d "$(pod_dir "$a")" ] || continue
+        for f in "$(pod_dir "$a")"/*; do
+          [ -e "$f" ] || continue
+          pod="$(basename "$f")"
+          if ! grep -qxF "$pod" <<< "$running"; then
+            found=1; mon="$(grep -m1 '^monitor=' "$f" | cut -d= -f2- || true)"
+            echo "stale pod registration → possible orphaned monitor:"
+            echo "  $a/$pod is registered but NOT running on RunPod${mon:+ (monitor task $mon)}"
+            echo "  → ask $a to TaskStop its monitor + 'ch pod-down $a $pod'; escalate to researcher if unsure it should be down"
+          fi
+        done
+      done
+    else
+      echo "(RunPod API unreachable — ran the watch-loop check only, skipped the pod check)"
+    fi
+  else
+    echo "(RunPod key unreadable — ran the watch-loop check only, skipped the pod check)"
+  fi
+  [ "$found" -eq 0 ] && echo "  clean — no orphaned watch loops, no pod registered-but-not-running"
+  return 0
+}
+
+cmd_board() { # ch board [project] — the bottleneck view. Which lane is BLOCKING, and who is drowning.
+  # The failure this exists to prevent: the writer sat with 8 open asks aimed at it, 104 unread,
+  # and no publish in 14h, and NOTHING surfaced it — a hand-survey found it. "Self-driving" means
+  # the choke point announces itself. A lane being ASKED but gone SILENT is the whole research
+  # stalling behind one agent. This is the same idea as the staleness hook, aimed at throughput
+  # instead of memory.
+  local project="${1:-hids-research}"
+  local stall_min="${CHANNELS_STALL_MIN:-45}"      # asked + silent this long = bottleneck
+  local backlog="${CHANNELS_BACKLOG:-40}"          # this many unread = drowning
+  local pod_stale="${CHANNELS_POD_STALE_MIN:-90}"  # pod up + lane silent this long = ABANDONED
+                                                    # (90m: GPU scoring is legitimately quiet 1-2h/pass; 20m cried wolf — researcher 1d01a285)
+  local now; now="$(date +%s)"
+  # answered ask/promise shas, same rule as cmd_open
+  local answered; answered="$(git -C "$ROOT" log --format=%s | grep -oE '\[(re|resolves) [0-9a-f]+\]' \
+                                | tr -d '[]' | awk '{print $2}' || true)"
+  echo "════ BOARD: $project ════"
+  local a flagged=0
+  for a in $(board_agents); do
+    [ "$a" = "tech-support" ] && continue
+    # open asks aimed at THIS lane: message commits tagged [asks a], not yet answered
+    local open_asks=0 oldest_ct="" sha ct rest
+    while read -r sha ct rest; do
+      [ -z "$sha" ] && continue
+      sha_closed_by "$sha" "$answered" && continue
+      git -C "$ROOT" show --name-only --diff-filter=A --format= "$sha" 2>/dev/null \
+        | grep -q 'MESSAGE\.md$' || continue
+      open_asks=$((open_asks+1))
+      oldest_ct="$ct"      # log is newest-first, so the last surviving ask is the OLDEST open one
+    done < <(git -C "$ROOT" log --format='%h %ct %s' -- "$project" | grep "\[asks $a\]" || true)
+    # age of the oldest still-open ask — a 3-minute ask and a 3-hour ask stop looking identical
+    local oldest_age="-"
+    if [ -n "$oldest_ct" ]; then
+      local om=$(( (now - oldest_ct) / 60 ))
+      if [ "$om" -ge 60 ]; then oldest_age="$(( om/60 ))h$(( om%60 ))m"; else oldest_age="${om}m"; fi
+    fi
+    ensure_mail "$a"
+    local box_f; box_f="$(mail_inbox "$a")"
+    # UNACKED = inbox messages whose FULL sha is not in the acked FULL set. Compare by full sha
+    # (resolve_full), NOT the raw short string, which drifts in length and miscounts fully-acked
+    # mail as a backlog (researcher 0d79870d — all 14 of its "unread" were acked). And it is
+    # UNACKED, not "unread": these may be read-and-acted, just not `ch ack`'d. Calling it "unread"
+    # made the board, `ch inbox`, and `ch ack` disagree on the same mailbox.
+    local acked_full inbox_full unacked
+    acked_full="$(acked_set "$a" | resolve_full | sort -u || true)"
+    inbox_full="$(cut -f1 "$box_f" 2>/dev/null | resolve_full || true)"
+    if [ -n "$acked_full" ]; then
+      unacked="$(printf '%s\n' "$inbox_full" | grep -vxF -f <(printf '%s\n' "$acked_full") | grep -c . )" || true
+    else
+      unacked="$(printf '%s\n' "$inbox_full" | grep -c . )" || true
+    fi
+    unacked="${unacked:-0}"
+    # silence = no ACTIVITY, not just no publish. A lane grinding a long task (standing up a
+    # substrate, a big build) publishes nothing for an hour but keeps touching its handoff via
+    # ch note/save — that is WORKING, not choked. Flagging it is a false positive, and a board
+    # that cries wolf on a working lane is one people learn to skim. So quiet = time since the
+    # MORE RECENT of (last publish, last handoff write).
+    local lp lh act; lp="$(git -C "$ROOT" log -1 --format=%ct -- "$project/$a/*/MESSAGE.md" 2>/dev/null)"
+    lh="$(git -C "$ROOT" log -1 --format=%ct -- "$project/$a/HANDOFF.md" 2>/dev/null)"
+    act="$lp"; [ -n "$lh" ] && { [ -z "$act" ] || [ "$lh" -gt "$act" ]; } && act="$lh"
+    local quiet_min=9999
+    [ -n "$act" ] && quiet_min=$(( (now - act) / 60 ))
+    local qh; if [ "$quiet_min" -ge 60 ]; then qh="$(( quiet_min/60 ))h$(( quiet_min%60 ))m"; else qh="${quiet_min}m"; fi
+    # registered running pods for this lane, + how many are BARE (no monitor task id recorded).
+    # A bare pod is the silent-death case runpod-ops warns about. "monitored" is SELF-REPORTED
+    # (a task id recorded at pod-up); the bus can't verify a Monitor is alive — owner-note
+    # freshness (quiet) is the real proxy. Shown as column visibility, not a hard alarm, so it
+    # doesn't cry wolf on a pod registered before --monitor existed.
+    local pods_up=0 pods_bare=0 pods_over=0 pf pf_launched pf_eta
+    if [ -d "$(pod_dir "$a")" ]; then
+      for pf in "$(pod_dir "$a")"/*; do
+        [ -e "$pf" ] || continue
+        pods_up=$((pods_up+1))
+        grep -q '^monitor=.' "$pf" 2>/dev/null || pods_bare=$((pods_bare+1))
+        # OVER-ETA: uptime exceeds the pod's OWN declared budget — a self-reported overrun, offline
+        # (no API needed). Distinct from ABANDONED (silent) — a pod can be actively noted yet blow
+        # past the runtime its owner declared, which is the wedge/underestimate signal.
+        pf_eta="$(grep -m1 '^eta_h=' "$pf" | cut -d= -f2- || true)"
+        pf_launched="$(grep -m1 '^launched=' "$pf" | cut -d= -f2- || true)"
+        if [ -n "$pf_eta" ] && [ -n "$pf_launched" ] && awk "BEGIN{exit !(($now-$pf_launched)/3600 > $pf_eta)}"; then
+          pods_over=$((pods_over+1))
+        fi
+      done
+    fi
+    local podcol="$pods_up"; [ "$pods_bare" -ge 1 ] && podcol="${pods_up}(${pods_bare}bare)"
+    # verdict, most-expensive-first: an abandoned pod (billing + silent) tops everything; then a
+    # lane asked-but-silent (now with the oldest ask's age); then an unacked pile.
+    local tag="  ok"
+    if [ "$pods_up" -ge 1 ] && [ "$quiet_min" -ge "$pod_stale" ]; then
+      tag="🔥 ABANDONED POD — $pods_up pod(s) up, lane silent ${qh} (billing + unwatched: check it or 'ch pod-down')"; flagged=1
+    elif [ "$open_asks" -ge 1 ] && [ "$quiet_min" -ge "$stall_min" ]; then
+      tag="⛔ BOTTLENECK — $open_asks ask(s) waiting (${oldest_age} oldest), silent ${qh}"; flagged=1
+    elif [ "$unacked" -ge "$backlog" ]; then
+      tag="⚠️  DROWNING — $unacked unacked"; flagged=1
+    fi
+    [ "$pods_over" -ge 1 ] && { tag="$tag ⏰ OVER-ETA($pods_over)"; flagged=1; }
+    printf '  %-11s asks-waiting:%-3s oldest:%-6s unacked:%-4s pods:%-8s quiet:%-7s %s\n' "$a" "$open_asks" "$oldest_age" "$unacked" "$podcol" "$qh" "$tag"
+  done
+  # Mid-handshake joiners: a session that ran `ch join` but has not armed its watch yet. Real but
+  # invisible to watch-liveness — the exact gap that hid writer#3. Stalled = surface it loudly.
+  local jf jid jage jrole jepoch jstall="${CHANNELS_JOIN_STALL_MIN:-45}"
+  for jf in "$ROOT"/.watch/*.joining; do
+    [ -e "$jf" ] || continue
+    jid="$(basename "$jf" .joining)"
+    watch_alive "$jid" && { rm -f "$jf"; continue; }   # armed (pre-sid code path) — lazy clear
+    jepoch="$(awk '{print $1; exit}' "$jf" 2>/dev/null)"; jrole="$(awk '{print $2; exit}' "$jf" 2>/dev/null)"
+    case "$jepoch" in ''|*[!0-9]*) jepoch="$now";; esac
+    jage=$(( (now - jepoch) / 60 ))
+    if [ "$jage" -ge "$jstall" ]; then
+      printf '  %-11s ⏳ JOINING %sm — ⚠️ STALLED mid-handshake (briefing off %s; surface to the %s leader, or reap: rm .watch/%s.joining)\n' "$jid" "$jage" "${jrole:-?}" "${jrole:-?}" "$jid"; flagged=1
+    else
+      printf '  %-11s ⏳ JOINING %sm (mid-handshake, briefing off %s)\n' "$jid" "$jage" "${jrole:-?}"
+    fi
+  done
+  board_spend_line
+  [ "$flagged" -eq 0 ] && echo "  (no bottleneck — everyone is either driving or unblocked)"
+  return 0
+}
+
+board_spend_line() { # print the CACHED spend/burn (offline — never hits the network). No wall exists
+                     # (balance auto-recharges), so this is a DISCIPLINE readout, not a countdown.
+  local c; c="$(spend_cache)"
+  [ -f "$c" ] || { echo "  spend: (unknown — run 'ch spend' to fetch per-pod spend + burn)"; return 0; }
+  local ts burn total running unregistered now age_m
+  ts="$(grep -m1 '^ts=' "$c" | cut -d= -f2-)"
+  burn="$(grep -m1 '^burn=' "$c" | cut -d= -f2-)"
+  total="$(grep -m1 '^total_spent=' "$c" | cut -d= -f2-)"
+  running="$(grep -m1 '^running=' "$c" | cut -d= -f2-)"
+  unregistered="$(grep -m1 '^unregistered=' "$c" | cut -d= -f2-)"
+  now="$(date +%s)"; age_m=$(( (now - ${ts:-$now}) / 60 ))
+  local age; if [ "$age_m" -ge 60 ]; then age="$(( age_m/60 ))h$(( age_m%60 ))m"; else age="${age_m}m"; fi
+  local flag=""
+  # HARD burn ceiling (operator directive): aggregate burn over $5/hr = a job is wrong, redo it.
+  local burn_cap="${CHANNELS_BURN_CAP:-2}"
+  awk "BEGIN{exit !(${burn:-0} > $burn_cap)}" && flag="  ⛔⛔ BURN \$${burn}/hr OVER \$$burn_cap CEILING — right-size or kill NOW"
+  [ "${unregistered:-0}" -ge 1 ] && flag="$flag  ⛔ $unregistered UNREGISTERED billing pod(s) — run 'ch spend'"
+  local stale="${CHANNELS_SPEND_STALE_MIN:-30}"
+  [ "$age_m" -ge "$stale" ] && flag="$flag  ⚠️ stale ${age} — run 'ch spend'"
+  printf '  spend: $%s/hr burn · $%s on %s running pod(s) [cached %s ago]%s\n' "${burn:-0}" "${total:-0}" "${running:-0}" "$age" "$flag"
+}
+
+cmd_await() { # ch await <sha> — block until my message is answered, then exit. ONE wake.
+  # Answers either an ask (a [re <sha>] reply) or a promise (a [resolves <sha>] delivery).
+  local target="$1" interval="${CH_WATCH_INTERVAL:-20}"
+  local short; short="$(git -C "$ROOT" rev-parse --short "$target" 2>/dev/null || echo "$target")"
+  while true; do
+    local hit
+    hit="$(git -C "$ROOT" log --format='%h %s' | grep -m1 -E "\[(re|resolves) $short" || true)"
+    if [ -n "$hit" ]; then
+      echo "ANSWERED $short → $hit"
+      return 0
+    fi
+    sleep "$interval"
+  done
+}
+
+cmd_open() { # ch open [project] — everything outstanding: asks awaiting a reply + promises
+  local project="${1:-}"
+  # Pull the SHA out of "[re 9efffa1]" / "[resolves 9efffa1]". Do NOT anchor with $ —
+  # the tag ends in ']', so an end-anchored match silently finds nothing and every ask
+  # stays "outstanding" forever.
+  local answered
+  answered="$(git -C "$ROOT" log --format=%s | grep -oE '\[(re|resolves) [0-9a-f]+\]' \
+                | tr -d '[]' | awk '{print $2}' || true)"
+  local any=0
+  echo "outstanding${project:+ in $project}:"
+  while read -r sha subject; do
+    [ -z "$sha" ] && continue
+    if sha_closed_by "$sha" "$answered"; then continue; fi
+    # An ask or promise lives in a MESSAGE.md, and only a message can be closed (re:/resolves).
+    # But `ch note`/`ch intend` echo a sent message's subject — tags and all — into the running
+    # log, so a note commit's subject can literally contain "[asks auditor]". That is not an ask;
+    # it is a description of one, and it has no MESSAGE.md to ever re: against, so it wedged the
+    # outstanding list open forever (auditor 83aff54). Count a commit only if it ACTUALLY added a
+    # message. This is the authoritative check and it kills the whole class, not just today's two.
+    git -C "$ROOT" show --name-only --diff-filter=A --format= "$sha" 2>/dev/null \
+      | grep -q 'MESSAGE\.md$' || continue
+    local kind="promise"
+    echo "$subject" | grep -q '\[asks ' && kind="ASK    "
+    echo "  $kind $sha  $subject"
+    any=1
+  done < <(git -C "$ROOT" log --format='%h %s' ${project:+-- "$project"} | grep -E '\[(promises|asks )' || true)
+  [ "$any" -eq 0 ] && echo "  (nothing outstanding)"
+  return 0
+}
+
+cmd_cursor() { # ch cursor <agent> — DEPRECATED alias, kept so in-flight sessions don't break.
+  # Old semantics were "mark everything read", which silently dropped unhandled messages.
+  # Now it acks everything currently addressed to you, and says so.
+  local agent="$1"
+  ensure_acks "$agent"
+  local out; out="$(addressed_msgs "$agent" "HEAD" "")"
+  local sha rest n=0
+  while IFS='|' read -r sha rest; do
+    [ -z "$sha" ] && continue
+    acked "$agent" "$sha" && continue
+    receipt_add "$agent" ack "$sha"; n=$((n+1))
+  done <<< "$out"
+  receipt_commit "$agent"
+  echo "NOTE: 'ch cursor' is deprecated — it just bulk-acked $n message(s)."
+  echo "      Use 'ch ack $agent <sha>' per message instead, so nothing is dropped unread."
+}
+
+cmd_promises() { # ch promises [project]
+  local project="${1:-}"
+  local resolved
+  resolved="$(git -C "$ROOT" log --format=%s | grep -oE '\[resolves [0-9a-f]+\]' \
+                | tr -d '[]' | awk '{print $2}' || true)"
+  echo "open promises${project:+ in $project}:"
+  local any=0
+  while read -r sha subject; do
+    [ -z "$sha" ] && continue
+    if sha_closed_by "$sha" "$resolved"; then continue; fi
+    echo "  $sha  $subject"
+    any=1
+  done < <(git -C "$ROOT" log --format='%h %s' ${project:+-- "$project"} | grep '\[promises\]' || true)
+  [ "$any" -eq 0 ] && echo "  (none)"
+  return 0
+}
+
+cmd_read() { # ch read <sha>  — show the message a commit published
+  git -C "$ROOT" show --stat --format='%h %an %ad%n%n  %s%n' "$1"
+}
+
+# ── self-continuity: an agent talking to its own next session ──────────────────
+# HANDOFF.md is MUTABLE (a live snapshot), unlike MESSAGE.md which is append-only mail.
+
+handoff_path() { echo "$1/$2/HANDOFF.md"; }  # <project>/<channel>/HANDOFF.md
+
+cmd_handoff() { # ch handoff <project> <channel>  — path to my handoff, scaffolding if absent
+  local project="$1" channel="$2"
+  is_agent "$channel" || die "no such identity: $channel (a role, or <role>#N)"
+  local rel; rel="$(handoff_path "$project" "$channel")"
+  if [ ! -f "$ROOT/$rel" ]; then
+    mkdir -p "$ROOT/$project/$channel"
+    local cur=""; [ -f "$ROOT/.cursors/$channel" ] && cur="$(tr -d '[:space:]' < "$ROOT/.cursors/$channel")"
+    sed -e "s/<channel>/$channel/g" -e "s/<project>/$project/g" \
+        -e "s/<agent>/$channel/g" -e "s/<YYYY-MM-DD>/$(today)/" \
+        -e "s/<sha you had read through when you wrote this>/${cur:-none}/" \
+        "$ROOT/HANDOFF-TEMPLATE.md" > "$ROOT/$rel"
+  fi
+  echo "$ROOT/$rel"
+}
+
+# ── skill version ─────────────────────────────────────────────────────────────
+# The protocol an agent is RUNNING is the copy of SKILL.md it loaded into context at session
+# start. Change the file and every live agent is silently running the old protocol — it does
+# not know, and neither do I, and I have already shipped `ch catchup` to a bus where nobody
+# had been told it exists. "Remember to announce it" is discipline, and discipline is exactly
+# what failed. So a skill change is an EVENT, delivered on the bus like any other.
+skill_file() { echo "${CHANNELS_SKILL:-$HOME/.claude/skills/channels/SKILL.md}"; }
+skill_hash() { # current hash of the protocol on disk, or empty if we cannot see it
+  local f; f="$(skill_file)"
+  [ -f "$f" ] || return 0
+  shasum -a 256 "$f" 2>/dev/null | cut -c1-12
+}
+skill_seen()  { echo "$ROOT/.skill/seen/$1"; }   # the currency VERSION THIS agent last loaded
+skill_note()  { [ -f "$ROOT/.skill/NOTE" ] && cat "$ROOT/.skill/NOTE" || echo "protocol changed"; }
+# The "must-reload" currency marker. This is the value staleness is measured against — NOT the
+# raw file hash. A MAJOR bump advances it; a MINOR bump (typo, threshold nudge, clarification)
+# does not. That decoupling fixes the cry-wolf flaw: before this, EVERY edit to SKILL.md re-staled
+# every lane, so the warning fired on trivia and lanes learned to skim it. Falls back to the live
+# file hash only if VERSION was never written (fresh repo), so behaviour degrades to the old
+# "any change = stale" rather than "never stale".
+skill_version() { local v; v="$(cat "$ROOT/.skill/VERSION" 2>/dev/null)"; [ -n "$v" ] && echo "$v" || skill_hash; }
+skill_stale() { # <agent> — is this agent behind the current CURRENCY version (not every edit)?
+  local ver; ver="$(skill_version)"; [ -z "$ver" ] && return 1
+  local f; f="$(skill_seen "$1")"
+  [ -f "$f" ] || return 1                        # never recorded: not stale, just new
+  [ "$(cat "$f")" = "$ver" ] && return 1
+  return 0
+}
+skill_mark() { # <agent> — record that this agent is CURRENT at the currency VERSION
+  local ver; ver="$(skill_version)"; [ -z "$ver" ] && return 0
+  mkdir -p "$ROOT/.skill/seen"
+  echo "$ver" > "$(skill_seen "$1")"
+  git_retry add -- ".skill/seen/$1" >/dev/null 2>&1 || true
+  git -C "$ROOT" diff --cached --quiet -- ".skill/seen/$1" 2>/dev/null || \
+    git_retry commit -q -m "skill($1): loaded $ver" >/dev/null 2>&1 || true
+}
+skill_warn() { # <agent> — print the loud banner if their protocol is behind
+  skill_stale "$1" || return 0
+  echo "⚠️  SKILL CHANGED — you are running an OUT-OF-DATE protocol."
+  echo "    $(skill_note)"
+  echo "    RELOAD the 'channels' skill now (invoke it), then re-run this command."
+  echo
+}
+
+cmd_skill_bump() { # ch skill-bump [--minor] "<one line: what changed>" — tech-support announces a protocol change
+  # Severity is the fix for cry-wolf. A MAJOR bump (default) advances the currency VERSION, so every
+  # lane goes stale and MUST reload before it acts. A MINOR bump records the changelog but leaves
+  # VERSION untouched, so nobody is re-staled — for typos, threshold nudges, wording. Use MAJOR only
+  # when a lane running the old text would actually misbehave (new command, changed convention,
+  # changed addressing rule); reach for --minor by default on small edits.
+  local minor=0
+  if [ "${1:-}" = "--minor" ]; then minor=1; shift; fi
+  local note="${*:-protocol changed}"
+  local cur; cur="$(skill_hash)"
+  [ -z "$cur" ] && die "cannot see the skill file ($(skill_file)) — set CHANNELS_SKILL"
+  mkdir -p "$ROOT/.skill"
+  if [ "$minor" -eq 1 ]; then
+    printf '[minor] %s\n' "$note" > "$ROOT/.skill/NOTE"
+    git_retry add -- ".skill/NOTE"
+    git -C "$ROOT" diff --cached --quiet -- ".skill/NOTE" || git_retry commit -q -m "skill[minor]: $note"
+    echo "skill MINOR change recorded — no reload required, nobody re-staled."
+    echo "  file hash now $cur; currency VERSION unchanged ($(skill_version))"
+    echo "  (the changelog lands in each lane's next resume; it is not a mandatory reload)"
+    return 0
+  fi
+  # MAJOR: advance the currency marker. Every lane whose seen != VERSION is now stale.
+  printf '[MAJOR] %s\n' "$note" > "$ROOT/.skill/NOTE"
+  echo "$cur" > "$ROOT/.skill/VERSION"
+  git_retry add -- ".skill/VERSION" ".skill/NOTE"
+  git -C "$ROOT" diff --cached --quiet -- ".skill/VERSION" ".skill/NOTE" || \
+    git_retry commit -q -m "skill[MAJOR]: $note"
+  local a stale=""
+  for a in "${AGENTS[@]}"; do skill_stale "$a" && stale="$stale $a"; done
+  echo "skill bumped (MAJOR) — currency VERSION now $cur"
+  echo "  changelog: $note"
+  if [ -n "$stale" ]; then
+    echo "  MUST reload (their watch fires [SKILL CHANGED] + their next resume warns):$stale"
+    echo "  each confirms with: ch skill-ack <agent>  (after reloading, no full resume needed)"
+  else
+    echo "  no agent is behind"
+  fi
+}
+
+cmd_skill_ack() { # ch skill-ack <agent> — a lane records it RELOADED to the current protocol
+  # The seen-file only advanced on a full `ch resume` before, so a lane that reloaded the skill
+  # off a [SKILL CHANGED] watch event WITHOUT resuming still showed stale on the board — the
+  # instrument under-reported currency (an inference gap: the lane was current, the file said not).
+  # This is the cheap confirmation: reload, then `ch skill-ack <you>`, and the board agrees.
+  local agent="${1:-}"; [ -n "$agent" ] || die "usage: ch skill-ack <you>"
+  is_agent "$agent" || die "unknown agent: $agent (one of: ${AGENTS[*]}, or <role>#N)"
+  skill_mark "$agent"
+  echo "recorded: $agent is now current at protocol VERSION $(skill_version)."
+  echo "  run this right after you reload the 'channels' skill — it needs no full 'ch resume'."
+}
+
+archive_handoff() { # <project> <channel> <content-source>  — snapshot a handoff, immutable + dated.
+  # HANDOFF.md is a rewritten-in-place snapshot of NOW, so a `ch save` that prunes the running log
+  # WIPES it from the working file — recoverable only by git archaeology nobody does (a 260-line
+  # handoff became 76, the whole session note-log gone from the file). Operator directive (97cc275,
+  # routed through the researcher): snapshot the version that carries the log to an append-only,
+  # DATED, file-visible archive. <content-source> is a command that prints the content to keep.
+  local project="$1" channel="$2"; shift 2
+  local content; content="$("$@" 2>/dev/null)"
+  [ -z "$content" ] && return 0
+  local sha; sha="$(git -C "$ROOT" log -1 --format=%h -- "$(handoff_path "$project" "$channel")" 2>/dev/null || echo nohead)"
+  local ts; ts="$(date -u +%Y-%m-%dT%H%M%S)"
+  local arch="$project/$channel/handoffs/HANDOFF-$ts-$sha.md"
+  mkdir -p "$ROOT/$project/$channel/handoffs"
+  printf '%s\n' "$content" > "$ROOT/$arch"
+  git_retry add -- "$arch" >/dev/null 2>&1 || true
+  echo "$arch"
+}
+
+cmd_save() { # ch save <project> <channel> [note...]  — commit my handoff + sweep lane artifacts
+  local project="$1" channel="$2"; shift 2
+  local note="${*:-session handoff}"
+  local rel; rel="$(handoff_path "$project" "$channel")"
+  [ -f "$ROOT/$rel" ] || die "no handoff yet: run 'ch handoff $project $channel' and fill it in"
+  local chdir="$project/$channel"
+  # The lane's own directory is what a save commits — the handoff AND its other durable artifacts
+  # (ledgers, logs, figures, the dated handoff archive). Before this, `ch save` staged ONLY
+  # HANDOFF.md, so a lane's CLAIMS_LEDGER.md / LIT_LOG.md rode uncommitted while every save printed
+  # success — the auditor's verdict record drifted ~35 iterations off the record this way (a255740f).
+  # The lane dir IS the lane's owned path ("stage only your own path"). The ONE exclusion is
+  # append-only mail (*/MESSAGE.md — owned by `ch send`, including unsent drafts); everything else,
+  # handoffs/ archive included, is durable lane state that belongs in the commit.
+  #
+  # EXCLUSION pathspec, reused for both the stage and the commit so they can never disagree:
+  local -a lanespec=( "$chdir/" ":(exclude,glob)$chdir/**/MESSAGE.md" )
+  # Stage untracked artifacts too (a partial commit `-- <paths>` does NOT pick up untracked files,
+  # so the add is what promotes a brand-new figure/ledger into the commit).
+  git_retry add -- "${lanespec[@]}"
+  if git -C "$ROOT" diff --cached --quiet -- "$chdir/"; then
+    echo "nothing changed under $chdir — nothing to save"
+    return 0
+  fi
+  # Archive the OUTGOING handoff (the committed HEAD copy) BEFORE this save overwrites it — that is
+  # the copy that still holds the note-log the new snapshot may have pruned. Only when the handoff
+  # itself is changing in this save (an artifact-only save leaves HEAD's handoff authoritative).
+  local arch=""
+  if ! git -C "$ROOT" diff --cached --quiet -- "$rel" && git -C "$ROOT" cat-file -e "HEAD:$rel" 2>/dev/null; then
+    arch="$(archive_handoff "$project" "$channel" git -C "$ROOT" show "HEAD:$rel")"
+  fi
+  # Name the non-handoff artifacts swept in, so an artifact commit is never silent.
+  local swept; swept="$(git -C "$ROOT" diff --cached --name-only -- "$chdir/" \
+    | grep -vxF "$rel" | grep -v '/MESSAGE\.md$' | grep -v "^$chdir/handoffs/" || true)"
+  # Commit SCOPED to this lane's paths — NOT a bare `git commit`. The worktree is shared: a bare
+  # commit sweeps the whole index, so a peer lane's concurrently-staged files ride into (or get
+  # stolen by) this commit, and a concurrent committer (a peer save, the receipts hook) can empty
+  # the index between the guard above and the commit — which made `git_retry commit` retry an empty
+  # commit 5× and die (builder e3e2ec04). A path-scoped partial commit touches only this lane's
+  # files, and an "empty" result is a clean no-op (a peer already captured our content), never fatal.
+  local msg="handoff($project/$channel): $note${arch:+ (+archived outgoing)}"
+  local out rc tries=0
+  while :; do
+    out="$(git -C "$ROOT" commit -q -m "$msg" -- "${lanespec[@]}" 2>&1)"; rc=$?
+    [ "$rc" -eq 0 ] && break
+    if printf '%s\n' "$out" | grep -qiE 'nothing to commit|no changes added|nothing added to commit|Changes not staged|working tree clean'; then
+      echo "nothing left under $chdir to commit — a concurrent save already captured it"
+      return 0
+    fi
+    tries=$((tries + 1))
+    [ "$tries" -ge 5 ] && die "git commit failed after $tries attempts: $out"
+    sleep 1
+  done
+  git -C "$ROOT" log -1 --format='saved %h  %s'
+  [ -n "$arch" ] && echo "  archived outgoing → $arch"
+  if [ -n "$swept" ]; then
+    echo "  swept lane artifacts into this commit:"
+    printf '%s\n' "$swept" | sed 's#^#    #'
+  fi
+  # Lean-handoff nudge (operator norm 5581437): the working file carries only what's needed
+  # next; verified detail lives in commits and the ch handoffs archive. A soft nudge, never a
+  # block — nothing gets lost, so pruning is safe.
+  local lines; lines="$(grep -c . "$ROOT/$rel" 2>/dev/null || echo 0)"
+  local limit="${CHANNELS_HANDOFF_MAX:-100}"
+  if [ "$lines" -gt "$limit" ]; then
+    echo "  ⚠️  handoff is $lines lines — carry only what's needed NEXT. Detail is in commits +"
+    echo "     'ch handoffs $project $channel'. Prune to the open decision, next actions, dead-ends."
+  fi
+  return 0
+}
+
+cmd_handoffs() { # ch handoffs <project> <channel>  — list the dated handoff archive
+  # Guard the args: under `set -u`, a bare `ch handoffs` blows up on unbound $1/$2 instead of
+  # printing usage (researcher 8505408).
+  local project="${1:-}" channel="${2:-}"
+  [ -n "$project" ] && [ -n "$channel" ] || die "usage: ch handoffs <project> <channel>"
+  local d="$ROOT/$project/$channel/handoffs"
+  [ -d "$d" ] || { echo "no archived handoffs for $project/$channel yet"; return 0; }
+  echo "════ HANDOFF ARCHIVE: $project/$channel ════"
+  ls -1 "$d"/HANDOFF-*.md 2>/dev/null | sort | sed 's#.*/#  #' || echo "  (none)"
+  return 0
+}
+
+cmd_resume() { # ch resume <agent> <project>  — THE session-start command
+  local agent="$1" project="${2:-}"
+  # Coming online IS the subscription event. Until an agent runs this, it is not listening
+  # and nothing is delivered to it — which is why an agent that has never started has an
+  # empty mailbox rather than a fabricated backlog.
+  ensure_subs "$agent"
+  # Duplicate-session guard, at the EARLIEST point: if a live peer session already holds this
+  # agent's watch, this new session is a duplicate lane. With session ids on both sides this is
+  # PROVABLE and resume REFUSES (one standdown admits ONE promotion — the builder dual-leader
+  # conflict, d77075b0). Same session id = our own watch, silent pass. Sid unknown on either
+  # side = the legacy warn-only behavior (pre-sid watches age out naturally).
+  local peer_sess; peer_sess="$(live_peer_watch "$agent")"
+  if [ -n "$peer_sess" ]; then
+    if same_watch_session "$agent"; then
+      : # our own watch from earlier in this session (re-resume after compaction) — not a duplicate
+    elif [ -n "${CLAUDE_CODE_SESSION_ID:-}" ] && [ -n "$(watch_sid "$agent")" ] && [ "${CH_RESUME_FORCE:-0}" != "1" ]; then
+      echo "⛔ REFUSED: '$agent' is already held by ANOTHER live session (watch pid $peer_sess, session $(watch_sid "$agent" | cut -c1-8)…)."
+      echo "    One standdown admits ONE promotion; a second REPLACE flow against the same vacancy is the"
+      echo "    builder dual-leader conflict (d77075b0). If the operator directed YOU to take this role:"
+      echo "    have the other session stand down first, or override deliberately:"
+      echo "        CH_RESUME_FORCE=1 ch resume $agent${project:+ $project}"
+      return 3
+    else
+      echo "⚠️  DUPLICATE-SESSION WARNING: another live '$agent' session appears active (watch pid $peer_sess)."
+      echo "    Two sessions as one agent clobber each other's HANDOFF.md and race verdicts/acks."
+      echo "    Confirm with the operator which session is canonical BEFORE you publish or ack as $agent."
+      echo "    (If you are the intended replacement, close the other session, then re-arm your watch.)"
+      echo
+    fi
+  fi
+  # Resume follows a skill reload (step 0 of the session), so this is the moment the agent
+  # genuinely holds the current protocol. Record it: that is what makes staleness detectable.
+  skill_mark "$agent"
+  echo "════ HANDOFF: $agent${project:+ @ $project} ════"
+  if [ -n "$project" ] && [ -f "$ROOT/$(handoff_path "$project" "$agent")" ]; then
+    cat "$ROOT/$(handoff_path "$project" "$agent")"
+    echo
+    echo "── handoff history ──"
+    git -C "$ROOT" log --oneline -5 -- "$(handoff_path "$project" "$agent")"
+    local hd="$ROOT/$project/$agent/handoffs"
+    if [ -d "$hd" ]; then
+      local nc; nc="$(ls -1 "$hd"/HANDOFF-*.md 2>/dev/null | grep -c . || echo 0)"
+      local latest; latest="$(ls -1 "$hd"/HANDOFF-*.md 2>/dev/null | sort | tail -1 | sed 's#.*/##')"
+      [ "$nc" -gt 0 ] && echo "  ($nc archived snapshot(s) in handoffs/, latest ${latest}; full note-log there — 'ch handoffs $project $agent')"
+    fi
+  else
+    echo "(no handoff — first session for $agent${project:+ on $project})"
+  fi
+  echo
+  cmd_inbox "$agent" "$project"
+  echo
+  echo "════ OPEN PROMISES ════"
+  cmd_promises "$project"
+}
+
+usage() {
+  cat <<'EOF'
+ch — macro-agent channel bus
+
+SESSION START / END (talking to your own next session)
+  ch resume    <agent> <project>                     ← FIRST THING. handoff + unread + promises
+  ch handoff   <project> <channel>                   path to my HANDOFF.md (scaffolds if absent)
+  ch save      <project> <channel> [note]            ← LAST THING. commit my handoff
+
+MAIL (talking to the other agents)
+  ch new       <project> <channel> <slug> <expect>   scaffold a MESSAGE.md (expectation REQUIRED)
+  ch intend    <project> <agent> <one-line>         write-ahead: what I am ABOUT to write
+  ch note      <project> <agent> <one-line>         append to my running log (do this often)
+  ch send      <project> <channel> <slug> <subject>  commit it (auto-tags asks/re/promises/resolves)
+  ch inbox     <agent> [project]                     YOUR MAILBOX: unread / read / waiting-on-you
+  ch subscribe   <agent> <channel>                  start receiving that channel (delivery begins NOW)
+  ch unsubscribe <agent> <channel>                  stop receiving it
+  ch subs        [agent]                            who listens to what
+  ch poll      <agent> [project]                     unacked mail (surfacing it marks it read)
+  ch ack       <agent> <sha>...                      read receipt — AFTER you act on that message
+  ch acks      <sha>                                 who has actually received a message
+  ch open      [project]                             asks awaiting a reply + undelivered promises
+  ch promises  [project]                             undelivered promises only
+  ch read      <sha>                                 show a message
+  ch cursor    <agent>                               DEPRECATED bulk-ack — use 'ch ack' per message
+
+WAKING (you cannot "hold a poll open" — an agent only exists while it runs)
+  ch watch     <agent> [project]                     stream new msgs addressed to you  → Monitor(persistent)
+  ch await     <sha>                                 block until MY message is answered → Bash(run_in_background)
+
+FLOW & PODS (the shared board and the pod registry)
+  ch board     [project]                             per-lane view: asks-waiting/oldest, unacked, pods, quiet
+  ch pods                                            who has a GPU pod up right now (mon: = monitor id, ⚠BARE = none)
+  ch pod-up    <agent> <podId> [--monitor <taskid>] [--eta <hours>] [note]  register a running pod
+  ch pod-down  <agent> <podId>                       deregister it the instant it stops
+  ch pod-request <project> <lane> <slug>             a lane asks tech-support to provision a pod (scaffolds the preflight bundle)
+  ch spend                                           per-pod $ spent + burn from RunPod; flags unregistered/over-budget pods; emails the operator on a ceiling breach
+  ch notify    [--key k] [--throttle min] <subj> [body]  email the operator (SES); body from stdin if omitted; throttled per-key (default 15m)
+  ch stuck     [--reap]                              find orphaned watch loops + pods registered-but-not-running (--reap kills the loops)
+  ch catchup   [project]                             everything outstanding, whole bus
+
+PROTOCOL VERSION (tech-support announces; lanes confirm)
+  ch skill-bump [--minor] "<changelog>"              tech-support: MAJOR re-stales all; --minor doesn't
+  ch skill-ack  <agent>                              a lane: "I reloaded" — clears my stale flag, no resume
+
+FRONTMATTER THAT DOES SOMETHING
+  subscribers: [a, b]   who it reaches. Address narrowly — everyone = shouting.
+  asks: <channel>       I need a reply from them; shows in their poll as ASKS-YOU
+  re: <sha>             this IS the reply (must address the asker back, or send is refused)
+  promises: <text>      I owe a future result        resolves: <sha>   here it is
+
+HANDOFF.md is mutable (your live snapshot). MESSAGE.md is append-only (mail you sent).
+channels: auditor researcher writer builder
+EOF
+}
+
+cmd_instances() { # ch instances <role>  — live instances of a role, leader first
+  local role="${1:-}"; [ -n "$role" ] || die "usage: ch instances <role>"
+  role="$(agent_role "$role")"
+  is_agent "$role" || die "unknown role: $role"
+  echo "════ instances of '$role' ════"
+  local a any=""
+  for a in "$role" $(online_agents | grep -E "^${role}#[0-9]+$" | sort -t'#' -k2 -n || true); do
+    watch_alive "$a" || continue
+    any=1
+    if [ "$a" = "$role" ]; then echo "  LEADER   $a"; else echo "  worker   $a"; fi
+  done
+  [ -n "$any" ] || echo "  (none live)"
+  local jf
+  for jf in "$ROOT/.watch/$role.joining" "$ROOT"/.watch/"$role"#*.joining; do
+    [ -e "$jf" ] || continue
+    a="$(basename "$jf" .joining)"; watch_alive "$a" && continue
+    echo "  joining  $a (mid-handshake — joined, watch not yet armed)"
+  done
+  echo "  role-addressed work (subscribers: [$role]) lands on the LEADER, who distributes to workers."
+}
+
+cmd_join() { # ch join <role> <project>  — bring THIS new session online as <role>; brief off the live leader
+  local role="${1:-}" project="${2:-}"
+  [ -n "$role" ] && [ -n "$project" ] || die "usage: ch join <role> <project>   (role: ${AGENTS[*]})"
+  is_instance "$role" && die "join takes a ROLE (e.g. builder), not an instance id (got '$role')"
+  is_agent "$role" || die "join: unknown role '$role' (one of: ${AGENTS[*]})"
+  local leader_live=""; watch_alive "$role" && leader_live=1
+  local workers; workers="$(online_agents | grep -E "^${role}#[0-9]+$" | while read -r w; do watch_alive "$w" && echo "$w"; done | tr '\n' ' ' | sed 's/ *$//' || true)"
+
+  if [ -z "$leader_live" ] && [ -z "$workers" ]; then
+    # Nobody live → you are the LEADER (base instance).
+    ensure_subs "$role"; skill_mark "$role"
+    echo "════ ch join: no live '$role' — you ARE the LEADER (base instance) ════"
+    echo
+    local hp; hp="$(handoff_path "$project" "$role")"
+    if [ -f "$ROOT/$hp" ]; then echo "── your handoff ($hp) ──"; cat "$ROOT/$hp"; else echo "(no handoff yet: ch handoff $project $role)"; fi
+    echo
+    echo "── NEXT ──"
+    echo "  • Arm your watch:  Monitor  ~/channels/bin/ch watch $role $project   (persistent)"
+    echo "  • ch resume $role $project   (full inbox + open board)"
+    echo "  • You lead this role: role-addressed work comes to you. If workers join (ch join $role),"
+    echo "    you distribute + balance across them. See who's live: ch instances $role"
+    return 0
+  fi
+
+  # A live leader/worker exists → join as a WORKER, brief off the leader.
+  local id; id="$(next_instance "$role")"
+  ensure_subs "$id"; skill_mark "$id"
+  # JOINING marker: from now until this instance arms its watch, it is mid-handshake — invisible
+  # to watch-liveness but real. The board surfaces it (and flags a stall); cmd_watch clears it.
+  mkdir -p "$ROOT/.watch"
+  printf '%s %s\n' "$(date +%s)" "$role" > "$ROOT/.watch/$id.joining" 2>/dev/null || true
+  # Coexisting instances coordinate on the ROLE channel; subscribe leader + every worker + you to it,
+  # so leader<->worker messages (which ride the role channel) actually deliver.
+  local peer
+  for peer in "$role" $workers "$id"; do
+    subscribed_to "$peer" "$role" || cmd_subscribe "$peer" "$role" >/dev/null 2>&1 || true
+  done
+  echo "════ ch join: '$role' is already live (leader: $role${workers:+ ; workers: $workers}) — you join as WORKER '$id' ════"
+  echo
+  echo "You are a distinct instance ('$id'): your own handoff/inbox, no clobbering. The LEADER ('$role')"
+  echo "owns role-addressed work and will distribute slices to you; you report back with subscribers: [$role]."
+  echo
+  local hp; hp="$(handoff_path "$project" "$role")"
+  if [ -f "$ROOT/$hp" ]; then echo "── leader's handoff ($hp) — a FIRST READ, not a substitute for talking to them ──"; cat "$ROOT/$hp"; fi
+  echo
+  echo "── PLAYBOOK: brief LIVE off the leader, then take assigned work ──"
+  echo "  1. Request a live briefing (a real ask; they answer from current context, not a static file):"
+  echo "       f=\$(ch new $project $id brief-request \"$id joining; requesting live handoff + my slice\")"
+  echo "       # edit \$f frontmatter:  subscribers: [$role]   asks: $role"
+  echo "       # body: what are you mid-flight on? what's my slice vs yours? landmines? what must I NOT touch?"
+  echo "       ch send $project $id brief-request \"$id joining — requesting live briefing\""
+  echo "  2. Wait for the reply (one wake, no token spin):  ch await <that-sha>   (Bash run_in_background)"
+  echo "  3. Iterate follow-ups (re: their sha, asks: $role) until you're briefed and have your slice."
+  echo "  4. Arm your watch and work your slice, reporting to the leader:"
+  echo "       Monitor  ~/channels/bin/ch watch $id $project   (persistent)"
+  echo
+  echo "  REPLACING the leader instead of assisting? Once briefed, the leader runs"
+  echo "  'ch standdown $role $project'; then you promote: 'ch resume $role $project' + arm the '$role' watch."
+  echo "  Your worker id this session: $id"
+  notify_join "$id" "$role" "$project"
+  return 0
+}
+
+cmd_standdown() { # ch standdown <instance> <project> [note]  — graceful exit: save handoff, free the identity
+  local who="${1:-}" project="${2:-}"; [ -n "$who" ] && [ -n "$project" ] || { die "usage: ch standdown <instance> <project> [note]"; }
+  shift 2
+  local note="${*:-standing down}"
+  is_agent "$who" || die "standdown: unknown identity '$who'"
+  if [ -f "$ROOT/$(handoff_path "$project" "$who")" ]; then
+    cmd_save "$project" "$who" "standdown: $note" >/dev/null 2>&1 || true
+    echo "handoff saved for '$who'."
+  fi
+  # Free the watch SLOT (remove the pidfile) so the board reads '$who' as no longer live. Do NOT
+  # kill the Monitor process here (that is the session's own TaskStop job — killing another pid by
+  # hand races the Monitor wrapper); dropping the pidfile is enough for liveness + successor pickup.
+  rm -f "$ROOT/.watch/$who.pid" "$ROOT/.watch/$who.sid" "$ROOT/.watch/$who.joining" 2>/dev/null || true
+  local role; role="$(agent_role "$who")"
+  echo "'$who' stood down (handoff saved, watch slot freed)."
+  echo "  • TaskStop your own watch monitor now, then end this session."
+  if is_instance "$who"; then
+    echo "  • You were a WORKER; the leader '$role' continues."
+  else
+    echo "  • You were the LEADER. A replacement can promote: ch resume $role $project + arm the '$role' watch."
+    echo "    (Your final handoff above is the context they inherit.)"
+  fi
+  return 0
+}
+
+[ $# -eq 0 ] && { usage; exit 0; }
+sub="$1"; shift
+case "$sub" in
+  join)     cmd_join "$@" ;;
+  standdown) cmd_standdown "$@" ;;
+  instances) cmd_instances "$@" ;;
+  new)      cmd_new "$@" ;;
+  intend)   cmd_intend "$@" ;;
+  note)     cmd_note "$@" ;;
+  send)     cmd_send "$@" ;;
+  poll)     cmd_poll "$@" ;;
+  subscribe)   cmd_subscribe "$@" ;;
+  unsubscribe) cmd_unsubscribe "$@" ;;
+  subs)        cmd_subs "$@" ;;
+  inbox)    cmd_inbox "$@" ;;
+  catchup)  cmd_catchup "$@" ;;
+  skill-bump) cmd_skill_bump "$@" ;;
+  skill-ack)  cmd_skill_ack "$@" ;;
+  board)    cmd_board "$@" ;;
+  pod-up)   cmd_pod_up "$@" ;;
+  pod-down) cmd_pod_down "$@" ;;
+  pod-request) cmd_pod_request "$@" ;;
+  pods)     cmd_pods "$@" ;;
+  spend)    cmd_spend "$@" ;;
+  notify)   cmd_notify "$@" ;;
+  stuck)    cmd_stuck "$@" ;;
+  handoffs) cmd_handoffs "$@" ;;
+  cursor)   cmd_cursor "$@" ;;
+  promises) cmd_promises "$@" ;;
+  read)     cmd_read "$@" ;;
+  handoff)  cmd_handoff "$@" ;;
+  save)     cmd_save "$@" ;;
+  resume)   cmd_resume "$@" ;;
+  watch)    cmd_watch "$@" ;;
+  await)    cmd_await "$@" ;;
+  open)     cmd_open "$@" ;;
+  ack)      cmd_ack "$@" ;;
+  acks)     cmd_acks "$@" ;;
+  -h|--help|help) usage ;;
+  *) die "unknown subcommand: $sub" ;;
+esac

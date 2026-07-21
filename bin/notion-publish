@@ -1,0 +1,309 @@
+#!/usr/bin/env python3
+"""notion-publish — durable, session-independent Notion publishing for the channels bus.
+
+  notion-publish <page> <markdown-file> [--append] [--dry-run]
+
+<page> is either a full Notion page UUID or a known short alias (see PAGES below).
+The integration token is read from the macOS keychain AT RUNTIME and is NEVER printed,
+logged, or written to disk. Do not pass it as an argument and do not commit it.
+
+Default behaviour REPLACES the page body: existing top-level children are archived, then
+the markdown is converted to Notion blocks and appended. --append leaves existing content
+and only adds. --dry-run converts and reports counts without touching Notion.
+
+Who runs this: the WRITER owns Notion publishing. The researcher supplies substance; the
+writer renders the study material and pushes it here. tech-support owns this plumbing.
+
+Markdown supported: #/##/### headings, - / * bullets, `N.` numbered lists, > quotes,
+``` fenced code (with language), --- divider, standalone images `![alt](path)`, and inline
+**bold** *italic* `code` [text](url). Blank lines separate paragraphs; soft line breaks
+inside a paragraph are kept.
+
+Images: a standalone `![alt](path)` line uploads the LOCAL file (path resolved relative to
+the markdown file) via the Notion file-upload API and emits an image block. The image block
+carries NO caption on purpose — the alt text stays in the repo markdown but is kept out of
+the API request, so a WAF-sensitive alt (e.g. a literal system path) can never block the
+publish. The upload endpoint is itself WAF-sensitive: a raster PNG/JPEG passes cleanly, but
+an SVG (XML text) with sensitive strings may be blocked — prefer PNG for such figures.
+"""
+import sys, os, json, subprocess, re, mimetypes, urllib.request, urllib.error
+
+NOTION_VERSION = "2022-06-28"
+KEYCHAIN_SERVICE = os.environ.get("NOTION_KEYCHAIN_SERVICE", "notion-api-token")
+KEYCHAIN_ACCT = os.environ.get("NOTION_KEYCHAIN_ACCT", "")  # the keychain account the token is stored under
+
+# Known pages the writer publishes to. Add aliases here as they are created.
+PAGES = {
+    # "study-guide": "<notion-page-uuid>",
+}
+
+API = "https://api.notion.com/v1"
+MAXLEN = 2000          # Notion rich-text plain_text hard limit per segment
+BATCH = 100            # max children per append request
+
+
+def die(msg):
+    sys.stderr.write("notion-publish: " + msg + "\n")
+    sys.exit(1)
+
+
+def get_token():
+    try:
+        tok = subprocess.check_output(
+            ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE,
+             "-a", KEYCHAIN_ACCT, "-w"],
+            stderr=subprocess.DEVNULL).decode().strip()
+    except subprocess.CalledProcessError:
+        die(f"token not in keychain (service={KEYCHAIN_SERVICE} acct={KEYCHAIN_ACCT}). "
+            "Add it, or ask the researcher who provisioned it.")
+    if not tok:
+        die("keychain returned an empty token.")
+    return tok
+
+
+def api(token, method, path, body=None):
+    url = API + path
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("Authorization", "Bearer " + token)
+    req.add_header("Notion-Version", NOTION_VERSION)
+    req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req) as r:
+            return json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode()
+        try:
+            j = json.loads(detail)
+            detail = f"{j.get('code')}: {j.get('message')}"
+        except Exception:
+            pass
+        die(f"{method} {path} -> HTTP {e.code} {detail}")
+
+
+# ---- inline markdown -> Notion rich_text --------------------------------------
+_IMG = re.compile(r"^!\[(?P<alt>[^\]]*)\]\((?P<path>[^)]+)\)\s*$")
+_INLINE = re.compile(
+    r"(\*\*(?P<b>.+?)\*\*)"
+    r"|(?<!\*)\*(?P<i>[^*]+?)\*(?!\*)"
+    r"|(`(?P<c>[^`]+?)`)"
+    r"|(\[(?P<lt>[^\]]+?)\]\((?P<lu>[^)]+?)\))")
+
+
+def _rt(text, ann=None, link=None):
+    out = []
+    ann = ann or {}
+    for i in range(0, len(text), MAXLEN):
+        chunk = text[i:i + MAXLEN]
+        t = {"type": "text", "text": {"content": chunk}}
+        if link:
+            t["text"]["link"] = {"url": link}
+        if ann:
+            t["annotations"] = ann
+        out.append(t)
+    return out
+
+
+def inline(text):
+    rts, pos = [], 0
+    for m in _INLINE.finditer(text):
+        if m.start() > pos:
+            rts += _rt(text[pos:m.start()])
+        if m.group("b") is not None:
+            rts += _rt(m.group("b"), {"bold": True})
+        elif m.group("i") is not None:
+            rts += _rt(m.group("i"), {"italic": True})
+        elif m.group("c") is not None:
+            rts += _rt(m.group("c"), {"code": True})
+        elif m.group("lt") is not None:
+            rts += _rt(m.group("lt"), link=m.group("lu"))
+        pos = m.end()
+    if pos < len(text):
+        rts += _rt(text[pos:])
+    return rts or _rt("")
+
+
+# ---- block markdown -> Notion blocks ------------------------------------------
+def blk(kind, rich, extra=None):
+    b = {"object": "block", "type": kind, kind: {}}
+    if rich is not None:
+        b[kind]["rich_text"] = rich
+    if extra:
+        b[kind].update(extra)
+    return b
+
+
+def to_blocks(md):
+    lines = md.replace("\r\n", "\n").split("\n")
+    blocks, para, i = [], [], 0
+
+    def flush():
+        nonlocal para
+        if para:
+            blocks.append(blk("paragraph", inline("\n".join(para))))
+            para = []
+
+    while i < len(lines):
+        ln = lines[i]
+        s = ln.strip()
+        if s.startswith("```"):                       # fenced code
+            flush()
+            lang = s[3:].strip() or "plain text"
+            buf, i = [], i + 1
+            while i < len(lines) and not lines[i].strip().startswith("```"):
+                buf.append(lines[i]); i += 1
+            code = "\n".join(buf)
+            rich = [{"type": "text", "text": {"content": code[j:j + MAXLEN]}}
+                    for j in range(0, max(len(code), 1), MAXLEN)] or _rt("")
+            blocks.append(blk("code", rich, {"language": lang}))
+            i += 1
+            continue
+        if not s:
+            flush(); i += 1; continue
+        m = _IMG.match(s)                             # standalone image -> upload placeholder
+        if m:
+            flush()
+            blocks.append({"__image__": True, "path": m.group("path"), "alt": m.group("alt")})
+            i += 1; continue
+        m = re.match(r"^(#{1,3})\s+(.*)", s)
+        if m:
+            flush()
+            lvl = len(m.group(1))
+            blocks.append(blk(f"heading_{lvl}", inline(m.group(2)))); i += 1; continue
+        if s in ("---", "***", "___"):
+            flush(); blocks.append({"object": "block", "type": "divider", "divider": {}})
+            i += 1; continue
+        m = re.match(r"^[-*]\s+(.*)", s)
+        if m:
+            flush(); blocks.append(blk("bulleted_list_item", inline(m.group(1))))
+            i += 1; continue
+        m = re.match(r"^\d+\.\s+(.*)", s)
+        if m:
+            flush(); blocks.append(blk("numbered_list_item", inline(m.group(1))))
+            i += 1; continue
+        m = re.match(r"^>\s?(.*)", s)
+        if m:
+            flush(); blocks.append(blk("quote", inline(m.group(1)))); i += 1; continue
+        para.append(s); i += 1
+    flush()
+    return blocks
+
+
+def upload_file(token, path):
+    """Upload a local file via the Notion single-part file-upload API; return its id.
+    The upload endpoint is WAF-sensitive; a raster image passes, an SVG with sensitive
+    text may not. We never send a caption, so alt text can't trip the WAF."""
+    create = api(token, "POST", "/file_uploads", {})
+    uid, upload_url = create.get("id"), create.get("upload_url")
+    if not uid or not upload_url:
+        die(f"file_upload create failed: {create}")
+    with open(path, "rb") as fh:
+        data = fh.read()
+    fname = os.path.basename(path)
+    mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
+    boundary = "----notionPublishBoundary7MA4YWxkTrZu0gW"
+    body = (f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="file"; filename="{fname}"\r\n'
+            f"Content-Type: {mime}\r\n\r\n").encode() + data + f"\r\n--{boundary}--\r\n".encode()
+    req = urllib.request.Request(upload_url, data=body, method="POST")
+    req.add_header("Authorization", "Bearer " + token)
+    req.add_header("Notion-Version", NOTION_VERSION)
+    req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
+    try:
+        with urllib.request.urlopen(req) as r:
+            res = json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode()[:200]
+        die(f"file upload POST failed HTTP {e.code}: {detail}\n"
+            "  (this endpoint is WAF-sensitive — a raster PNG/JPEG usually passes; an SVG "
+            "with sensitive text may be blocked. Try a PNG.)")
+    if res.get("status") != "uploaded":
+        die(f"file upload did not complete: status={res.get('status')} {res}")
+    return uid
+
+
+def resolve_page(arg):
+    if arg in PAGES:
+        return PAGES[arg]
+    if re.fullmatch(r"[0-9a-fA-F-]{32,36}", arg):
+        return arg
+    die(f"unknown page '{arg}'. Use a full UUID or one of: {', '.join(PAGES)}")
+
+
+def clear_children(token, page):
+    n, cursor = 0, None
+    while True:
+        q = f"/blocks/{page}/children?page_size=100" + (f"&start_cursor={cursor}" if cursor else "")
+        r = api(token, "GET", q)
+        for c in r.get("results", []):
+            api(token, "PATCH", f"/blocks/{c['id']}", {"archived": True})
+            n += 1
+        if not r.get("has_more"):
+            break
+        cursor = r.get("next_cursor")
+    return n
+
+
+def main():
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    flags = {a for a in sys.argv[1:] if a.startswith("--")}
+    if len(args) != 2:
+        die("usage: notion-publish <page|alias> <markdown-file> [--append] [--dry-run]")
+    page = resolve_page(args[0])
+    path = args[1]
+    if not os.path.isfile(path):
+        die(f"no such file: {path}")
+    with open(path) as f:
+        md = f.read()
+    blocks = to_blocks(md)
+    if not blocks:
+        die("markdown produced zero blocks — nothing to publish.")
+    base = os.path.dirname(os.path.abspath(path))
+
+    def imgpath(b):
+        return b["path"] if os.path.isabs(b["path"]) else os.path.join(base, b["path"])
+
+    n_img = sum(1 for b in blocks if b.get("__image__"))
+    print(f"converted {path} -> {len(blocks)} Notion blocks ({n_img} image(s), "
+          f"{'append' if '--append' in flags else 'replace'} mode, page {page})")
+    if "--dry-run" in flags:
+        kinds, missing = {}, []
+        for b in blocks:
+            if b.get("__image__"):
+                kinds["image"] = kinds.get("image", 0) + 1
+                if not os.path.isfile(imgpath(b)):
+                    missing.append(b["path"])
+            else:
+                kinds[b['type']] = kinds.get(b['type'], 0) + 1
+        print("block kinds:", ", ".join(f"{k}:{v}" for k, v in sorted(kinds.items())))
+        if missing:
+            print("MISSING image file(s):", ", ".join(missing))
+        print("DRY RUN — nothing sent to Notion.")
+        return
+    token = get_token()
+    # resolve image placeholders -> uploaded image blocks (no caption: WAF-safe)
+    resolved = []
+    for b in blocks:
+        if b.get("__image__"):
+            ip = imgpath(b)
+            if not os.path.isfile(ip):
+                die(f"image not found: {b['path']} (resolved to {ip})")
+            uid = upload_file(token, ip)
+            print(f"uploaded {os.path.basename(ip)} -> file_upload {uid[:8]}")
+            resolved.append({"object": "block", "type": "image",
+                             "image": {"type": "file_upload", "file_upload": {"id": uid}}})
+        else:
+            resolved.append(b)
+    blocks = resolved
+    if "--append" not in flags:
+        removed = clear_children(token, page)
+        print(f"archived {removed} existing top-level block(s)")
+    for i in range(0, len(blocks), BATCH):
+        chunk = blocks[i:i + BATCH]
+        api(token, "PATCH", f"/blocks/{page}/children", {"children": chunk})
+        print(f"appended {min(i + BATCH, len(blocks))}/{len(blocks)}")
+    print(f"PUBLISHED {len(blocks)} blocks to Notion page {page}")
+
+
+if __name__ == "__main__":
+    main()

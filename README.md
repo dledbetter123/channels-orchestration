@@ -79,6 +79,31 @@ and no agent publishes to it.
 8. [`docs/lessons.md`](docs/lessons.md): the incidents that shaped the rules. Read this if
    you only read one thing; every rule in the protocol was paid for.
 
+## The code
+
+The implementation ships alongside the docs, copied from the live bus:
+
+```
+bin/ch                      # the bus CLI (~2000 lines of bash): mail, board, pods, spend, watches
+bin/notion-publish          # markdown -> Notion publisher (token read from the OS keychain at runtime)
+hooks/                      # Claude Code lifecycle hooks: pre-compaction handoff autosave,
+                            #   session-start re-briefing, and the staleness check
+skills/channels/            # the full bus protocol, as loaded by every agent session
+skills/channels-join/       # the join flow for adding/replacing a session on a role
+skills/runpod-ops/          # the GPU pod operations discipline
+```
+
+To stand up your own bus: create a git repo (this system uses `~/channels`), put `ch` on
+your PATH, install the hooks in your agent runtime's hook directory, and give your agents
+the `skills/` content as loadable instructions. `ch` scaffolds lane directories, handoffs,
+and messages on first use.
+
+The copies are verbatim except for sanitization: personal notification defaults were
+replaced with required environment variables (`CHANNELS_NOTIFY_FROM`, `CHANNELS_NOTIFY_TO`,
+`CHANNELS_AWS_PROFILE`, `NOTION_KEYCHAIN_ACCT`), hook git-identity fallbacks were
+neutralized, and a private Notion page map was emptied. No secrets ever lived in the code:
+tokens are read from the OS keychain or AWS profiles at runtime.
+
 ## Status
 
 This documents a live private system (the bus repo itself contains research mail and stays
