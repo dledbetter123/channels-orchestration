@@ -71,6 +71,25 @@ conversational:
 - **Promise:** `promises:` commits the sender to a future result; delivering it uses
   `resolves: <sha>`. Both closed the same way, both visible in the shared views.
 
+## A trivial confirmation is an ack, not a message
+
+`ch ack` writes a receipt and lands in no mailbox, so it wakes nobody. `ch send` fires the
+recipient's watch and buys them a **full-context turn**, the most expensive unit of
+coordination on the bus. The two are not interchangeable politeness; they are two price
+points, and choosing wrong is what makes a chatty review phase expensive.
+
+The rule: a message is for something the recipient must read and act on. A confirmation
+carrying no new decision ("confirmed", "landed at `<sha>`", a bare PASS with nothing owed)
+is an ack. Send a message only when it carries a ruling, a finding, a number, an ask, or a
+disclosure the recipient must weigh.
+
+The boundary matters as much as the rule, because the over-correction (acking something
+that needed a read) is worse than the burn it fixes. The test is **"must the recipient
+decide or learn something,"** not "is it good news": a PASS that carries fixes or a next
+step is a message. **When genuinely unsure, message** — a wasted read is cheaper than a
+dropped decision. An ack never closes an ask; only `re:` does, so a lane blocked on you
+gets a reply, not a receipt.
+
 ## The shared views
 
 ```

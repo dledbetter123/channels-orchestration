@@ -458,6 +458,40 @@ Seeing a message is not handling it, which is why `read` and `acked` are differe
 A message you surface but never ack stays in your inbox forever, deliberately: **the bus
 would rather nag you than lose your work.**
 
+### A trivial confirmation is an ACK, not a MESSAGE (researcher ruling 2026-07-21, `0c6ec978`)
+
+**`ch ack` writes a receipt only. It never lands in a mailbox, so it wakes NOBODY.** A
+`ch send`, by contrast, fires the recipient's watch and re-invokes them as a **full-context
+turn** — the single most expensive unit of coordination on this bus. So the two are not
+interchangeable politeness, they are two different price points, and picking the wrong one
+is what made a chatty QA arc expensive.
+
+**The rule:** a MESSAGE is for something the recipient must read and act on. A confirmation
+that carries no new decision — "eyeball CONFIRMED", "landed at `<sha>`", "acked", a bare PASS
+with nothing owed — is an **`ch ack`**, not a message. Send a message only when it carries a
+**ruling, a finding, a number, an ask, or a disclosure the recipient must weigh**. "I did the
+thing you asked, nothing new" is an ack.
+
+**The test is "must the recipient DECIDE or LEARN something," NOT "is it good news."** A PASS
+that carries fixes, a finding, or a next step **is** a message: it has content to act on. This
+boundary matters — the over-correction (acking things that actually needed a read) is worse
+than the burn it fixes. **When genuinely unsure, message.** A wasted read is cheaper than a
+dropped decision.
+
+Closing an ask still requires a `re:` message, because only `re:` closes an ask. An ack is a
+receipt, not an answer: if someone is *blocked* on you, they need the reply.
+
+### Cheaper wakes: `ch watch <you> <project> --digest <min>`
+
+Every watch line is a full-context turn, so N messages arriving minutes apart cost N turns even
+when each is one line. `--digest W` holds arriving mail until your mailbox has been quiet for W
+minutes, then delivers **one** batched wake. Measured on this bus (60 consecutive deliveries,
+median gap 4.0 min): **W=5 → 62% fewer wakes, W=10 → 85%.** It is opt-in and per-lane; the
+default is off. Carve-outs: **`ch await` is never debounced** (a blocking round-trip still wakes
+you immediately), a `[SKILL CHANGED]` event flushes instantly, and a hard cap at 3W keeps a
+continuous stream from being held forever. Arming it is a lane's own call, not a governance
+change: if your role is being woken in bursts, take it.
+
 **Your mailbox is never backfilled, and that is on purpose.** If you come online for the
 first time long after the project started, mail sent before you subscribed was never yours:
 you were not listening, so nothing was delivered. Inventing unreads for it would be a lie
