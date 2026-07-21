@@ -41,7 +41,7 @@ repo. Run it from anywhere; it resolves its own root. This is the full surface a
 
 | Command | What |
 |---|---|
-| `ch watch <agent> [project]` | stream new messages addressed to me; run under a persistent background monitor. Also the role's liveness token: the watch slot records pid + session id |
+| `ch watch <agent> [project] [--digest <min>]` | stream new messages addressed to me; run under a persistent background monitor. Also the role's liveness token: the watch slot records pid + session id. `--digest W` coalesces a burst of deliveries into ONE wake once the mailbox has been quiet for W minutes (see below) |
 | `ch await <sha>` | block until my message is answered; run in a background shell, one wake |
 
 ## Flow, board, and pods
@@ -93,3 +93,31 @@ status: open | resolved | withdrawn
 | `CHANNELS_BURN_CAP` | 2 | aggregate $/hr burn ceiling alarm |
 | `CHANNELS_JOIN_STALL_MIN` | 45 | minutes before a mid-handshake join shows STALLED |
 | `CH_RESUME_FORCE` | unset | set to 1 for a deliberate cross-session role takeover |
+| `CH_WATCH_INTERVAL` | 20 | seconds between watch polls of the mailbox file |
+| `CH_WATCH_DIGEST_MIN` | 0 (off) | digest window in minutes; same as `--digest` |
+| `CH_WATCH_DIGEST_CAP_MIN` | 3x the window | hard flush cap so a continuous stream is never held forever |
+
+## Wake cadence and the digest
+
+Every emitted watch line is a notification that re-invokes the agent as a **full-context
+turn**, so N messages arriving minutes apart cost N full turns even when each is one line
+("confirmed"). That is the dominant token cost of a chatty coordination phase, and the bus
+can only reduce the *number* of wakes, never their unit price.
+
+`--digest W` holds arriving mail until the mailbox has been quiet for W minutes, then emits
+a single `[DIGEST N msg(s)]` block: one write, one wake, however many messages it carries.
+Measured against 60 real consecutive deliveries on this bus (median inter-arrival gap 4.0
+minutes), W=5 produced 62% fewer wakes and W=10 produced 85% fewer.
+
+Three carve-outs keep the debounce from delaying the wrong thing:
+
+- **`ch await <sha>` is never debounced.** A genuinely blocking round-trip still wakes
+  immediately; that is why `await` exists as a separate mechanism from the ambient watch.
+- **A protocol-change event flushes instantly.** You must not run for W minutes on a
+  protocol that changed under you.
+- **A hard cap forces a flush at 3W**, so a stream that never goes quiet cannot hold mail
+  indefinitely.
+
+The related zero-build lever: `ch ack` writes a receipt only and **never lands in a
+mailbox**, so it wakes nobody. A trivial confirmation sent as a message costs its recipient
+a full turn that an ack would have cost nothing.

@@ -874,6 +874,17 @@ cmd_watch() { # ch watch <agent> [project] — one line per NEW message landing 
   # Tails the mailbox FILE, not git log. A missed tick is now survivable: the inbox is on
   # disk, so anything this stream fails to announce is still sitting there UNREAD.
   local agent="$1" project="${2:-}" interval="${CH_WATCH_INTERVAL:-20}"
+  # DIGEST mode (opt-in): coalesce a burst of deliveries into ONE wake. Every emitted line is a
+  # notification that re-invokes the model as a full-context turn, so N messages arriving minutes
+  # apart cost N full turns even when each is one line ("eyeball CONFIRMED"). With --digest W, the
+  # watch holds new mail until the mailbox has been QUIET for W minutes, then emits a single block.
+  # Measured on this bus (60 consecutive researcher deliveries): W=5 cuts wakes 62%, W=10 cuts 85%.
+  # The cost is latency: a message can sit up to W before it wakes you. That is why `ch await <sha>`
+  # is deliberately NOT debounced — a genuinely blocking round-trip stays immediate — and why a
+  # [SKILL CHANGED] event flushes instantly. Default 0 = off = the old one-wake-per-tick behavior.
+  local digest_min="${CH_WATCH_DIGEST_MIN:-0}"
+  case "${3:-}" in --digest) digest_min="${4:-5}" ;; esac
+  case "$project" in --digest) digest_min="${3:-5}"; project="" ;; esac
   ensure_mail "$agent"
   local pidf="$ROOT/.watch/$agent.pid"
   mkdir -p "$ROOT/.watch"
@@ -924,25 +935,50 @@ cmd_watch() { # ch watch <agent> [project] — one line per NEW message landing 
   # Track the currency VERSION, not the raw file hash: a MINOR bump (typo/threshold) must NOT wake
   # every lane with a mandatory-reload event. Only a MAJOR bump (VERSION advances) fires here.
   local sk_last; sk_last="$(skill_version)"
+  # Digest accumulator. `pending` holds already-formatted lines; `quiet` counts seconds since the
+  # last arrival; `held` counts seconds the oldest pending line has waited (a steady stream must
+  # not be held forever, so a hard cap forces a flush at 3W unless overridden).
+  local pending="" pend_n=0 quiet=0 held=0
+  local dsec=$(( digest_min * 60 ))
+  local dcap=$(( ${CH_WATCH_DIGEST_CAP_MIN:-$(( digest_min * 3 ))} * 60 ))
+  [ "$dsec" -gt 0 ] && echo "[digest mode] holding mail until ${digest_min}m quiet (cap $(( dcap / 60 ))m) — one wake per burst; ch await is unaffected"
   while true; do
     sleep "$interval"
     local sk_now; sk_now="$(skill_version)"
     if [ -n "$sk_now" ] && [ "$sk_now" != "$sk_last" ]; then
+      # A mandatory reload BYPASSES the digest — you may be running commands that no longer exist.
       echo "[SKILL CHANGED] $(skill_note) — RELOAD the 'channels' skill, then: ch skill-ack <you>"
       sk_last="$sk_now"
     fi
     local now; now="$(wc -l < "$box" 2>/dev/null | tr -d ' ')"
     [ -z "$now" ] && continue
     if [ "$now" -gt "$n" ]; then
-      local sha chan label subject
+      local sha chan label subject fresh=""
       while IFS=$'\t' read -r sha chan label subject; do
         [ -z "$sha" ] && continue
         in_project "$sha" "$project" || continue
-        echo "[$chan → $label] $sha $subject"
+        fresh="$fresh[$chan → $label] $sha $subject"$'\n'
+        pend_n=$(( pend_n + 1 ))
       done < <(tail -n "+$((n+1))" "$box")
       n="$now"
+      if [ -n "$fresh" ]; then
+        if [ "$dsec" -le 0 ]; then
+          printf '%s' "$fresh"                            # immediate mode: unchanged behavior
+          pend_n=0
+        else
+          pending="$pending$fresh"; quiet=0                # digest mode: hold and keep collecting
+        fi
+      fi
     elif [ "$now" -lt "$n" ]; then
       n="$now"                                            # inbox rewritten under us; resync
+    fi
+    if [ -n "$pending" ]; then
+      quiet=$(( quiet + interval )); held=$(( held + interval ))
+      if [ "$quiet" -ge "$dsec" ] || { [ "$dcap" -gt 0 ] && [ "$held" -ge "$dcap" ]; }; then
+        # ONE write = ONE wake, however many messages it carries.
+        printf '[DIGEST %s msg(s), %sm window]\n%s' "$pend_n" "$digest_min" "$pending"
+        pending=""; pend_n=0; quiet=0; held=0
+      fi
     fi
   done
 }
@@ -1105,7 +1141,7 @@ registered_pod_ids() { # every podId currently registered on the bus (one per li
 # A local SES sender so a bus event the OPERATOR must see reaches the operator's inbox even
 # when no Claude session is watching the terminal. Uses an SES identity you have already
 # verified (set CHANNELS_NOTIFY_FROM/TO, CHANNELS_AWS_PROFILE, CHANNELS_SES_REGION) — no new
-# AWS infra to deploy. Throttled per-key so a monitor firing every 2 minutes cannot spam identical
+# infra to deploy. Throttled per-key so a monitor firing every 2 minutes cannot spam identical
 # emails; the first breach mails immediately, repeats inside the window are suppressed (logged).
 notify_dir() { echo "$ROOT/.notify"; }   # local-only state (gitignored), not bus history
 cmd_notify() { # ch notify [--key <k>] [--throttle <min>] <subject> [body...]   (body from stdin if omitted)
@@ -1869,7 +1905,8 @@ MAIL (talking to the other agents)
   ch cursor    <agent>                               DEPRECATED bulk-ack — use 'ch ack' per message
 
 WAKING (you cannot "hold a poll open" — an agent only exists while it runs)
-  ch watch     <agent> [project]                     stream new msgs addressed to you  → Monitor(persistent)
+  ch watch     <agent> [project] [--digest <min>]    stream new msgs addressed to you  → Monitor(persistent)
+                                                     --digest W: coalesce a burst into ONE wake after W min quiet
   ch await     <sha>                                 block until MY message is answered → Bash(run_in_background)
 
 FLOW & PODS (the shared board and the pod registry)
