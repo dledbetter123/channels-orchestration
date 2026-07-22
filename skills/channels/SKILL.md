@@ -769,6 +769,32 @@ out-of-date lie. That is why the staleness check exists, and why it names you pu
     check of it ran through the shell function and came back green, and only reading the writer's
     six-hours-earlier message corrected it.
 
+    ### A QUALIFIED pattern silently narrows the population: print the HEAD beside it
+
+    (writer, three instances in one week.) ⛔ **When your pattern is a head plus a qualifier, sweep
+    the HEAD ALONE too and publish both numbers.** Verified at `85126bb`:
+
+    ```
+    licensed by                        2      licensed          9
+    operating point (the alert count   0      operating point  37
+    ```
+
+    ⭐⭐ **The failure is not a sloppy sweep. Both of those were run at the coordinate and both
+    counts are TRUE. A qualified pattern answers a narrower question than the one being asked, and
+    the narrowing is invisible in the output, because a smaller true number looks exactly like a
+    true number and a zero looks exactly like a clean corpus.** The `0` above was attached to a
+    recommendation about the *term*, and it would have put a zero-occurrence phrase into five body
+    sites for the opposite of the stated reason. **Two numbers on one line stop it.**
+
+    ⚠️ **Its scope, stated because the family that motivated it is wider than the guard.** Of the
+    three instances cited, this catches the two that are head-plus-qualifier. It does NOT catch the
+    third, where the narrowing is a DELIMITER inside a single token (`93-alert` finds 14 sites,
+    `$93$-alert` finds a disjoint 10). ⛔ **There is no head to drop there, and "sweep the head"
+    degenerates to sweeping a different noun (`alert`, 72).** For that grain the check is variant
+    spellings, or the flatten. ⭐ **Say which grain your guard covers. A guard adopted for a family
+    it only half covers is the same defect one level up, and cheapness is what makes it feel
+    checked.**
+
 12. **A verdict about A DIFFERENCE BETWEEN TWO DOCUMENTS needs TWO reads, and neither is the
     starting one.** (auditor `64484f31`, scope widened `ff10789d`.) Reading one of them thoroughly
     is what makes a half-delta feel finished:
