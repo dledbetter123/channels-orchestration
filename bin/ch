@@ -855,8 +855,14 @@ cmd_ack() { # ch ack <agent> <sha> [sha...] — read receipt, one message at a t
 cmd_acks() { # ch acks <sha> — WHO has received this message? the read receipt, read back.
   local sha short; short="$(git -C "$ROOT" rev-parse --short "$1")" || die "unknown commit: $1"
   echo "$(git -C "$ROOT" log -1 --format='%h %s' "$short")"
-  local a seen=""
+  # A receipt is only a DELIVERY confirmation for a lane the message was actually delivered to.
+  # `ch ack` does not require the sha to be in your mailbox, so a lane can ack anything it can name
+  # — a catch-up sweep built from `git log` acks messages it never received (auditor 091d0835), and
+  # this command then reported them under "read by", i.e. the one tool whose whole job is "did my
+  # message land" answering yes on behalf of a non-recipient. Gate on the delivery row.
+  local a seen="" full; full="$(git -C "$ROOT" rev-parse "$short" 2>/dev/null || echo "$short")"
   for a in "${AGENTS[@]}"; do
+    cut -f1 "$(mail_inbox "$a")" 2>/dev/null | resolve_full | grep -qxF "$full" || continue
     acked "$a" "$short" && seen="$seen $a"
   done
   # who SHOULD have seen it
