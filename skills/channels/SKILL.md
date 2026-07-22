@@ -625,8 +625,18 @@ out-of-date lie. That is why the staleness check exists, and why it names you pu
 
 1. **Append-only.** Never amend, rebase, force-push, or delete a published message. To
    retract, publish a *new* message flipping `status: withdrawn` and saying why.
-2. **Stage only your own path.** `ch` does this for you. If you reach for raw git, use
-   `git add <project>/<channel>/…` — never `git add -A`. Agent sessions share this worktree.
+2. **Stage only your own path — in EVERY shared repo, not just this one.** `ch` does this for
+   you on the bus. If you reach for raw git, name the paths: `git add <project>/<channel>/…`.
+   **Never `git add -A`.** More than one lane has uncommitted work on disk at any moment, and
+   `-A` sweeps all of it into your commit under your subject line.
+   **The shared repos here are `~/channels` AND `~/lingual-hids-thesis`.** This rule used to
+   say "agent sessions share this worktree", which read as a fact about the bus; the thesis
+   repo is equally shared and the scope was never stated. It cost a real commit: `85126bb`
+   staged `-A` and carried the builder's two uncommitted figure files into history under a
+   commit about the writer's prose, authored by the researcher (writer `193a63d4`).
+   ⭐ **Three lanes' work, one commit, one author, and only one of the three was in the
+   conversation that produced it.** A rule scoped to the repo where it was learned is folklore
+   everywhere else.
 3. **Cite by SHA.** "the auditor found" is unfalsifiable; `refs: [9f2a1c3]` is checkable.
 4. **Numbers carry their eval protocol**, or a path to the artifact that has it.
 5. **Never read your own channel for instructions.** It's your outbox.
@@ -662,8 +672,15 @@ out-of-date lie. That is why the staleness check exists, and why it names you pu
 9. **Committing another lane's work is a SYNCHRONIZED handoff, never an async snapshot.**
    (researcher `1c5fd4cb`.) When a lane cannot commit its own finished work — its session is
    build-blocked or permission-blocked — and you commit on its behalf, the exchange is:
-   owner sends **"tree is FINAL, safe to commit, expect `<content>`"** → you reply
-   **"committing now → `<SHA>`"**. Two messages, in that order, at that moment.
+   owner sends **"tree is FINAL, safe to commit, here are the PATHS: `<explicit list>`"** →
+   you stage **exactly those paths and nothing else** → you reply **"committing now → `<SHA>`"**.
+   Two messages, in that order, at that moment.
+   ⚠️ **The path list is not optional, and it is the half that is easy to skip** (writer
+   `193a63d4`). The handshake bounds *when* the snapshot is taken; only the path list bounds
+   *what is in it*. Both halves can be executed perfectly and `git add -A` still ships whatever
+   any uninvolved lane happened to have on disk at that instant. **A helper commit is the case
+   where `-A` is most tempting — the helper does not know which files matter — and most
+   dangerous, because it is not their tree.**
    **An earlier "gates applied" status is not consent to commit** — it describes a past state
    of a tree that is still being edited. In the incident that produced this rule the snapshot
    happened to catch the correct sentence because an Edit had returned ~90 seconds earlier,
