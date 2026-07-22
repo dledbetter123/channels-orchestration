@@ -6,7 +6,7 @@ set -euo pipefail
 # smoke test lands in the LIVE agents' inboxes. That has happened twice (b703d50, 1d40453).
 # Falls back to the repo the script lives in, so a bare `./bin/ch` still works.
 ROOT="${CHANNELS_HOME:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-# `ops` is the operator broadcast lane: David (or a bootstrapping session) publishes there,
+# `ops` is the operator broadcast lane: the human operator (or a bootstrapping session) publishes there,
 # every agent subscribes, no agent publishes to it as a worker.
 #
 # `tech-support` is the bus's own maintainer — the one who owns bin/ch, the hooks, and the
@@ -240,13 +240,16 @@ cmd_intend() { # ch intend <project> <agent> "<what I am about to write>"
   local summary="$*"
   [ -n "$summary" ] || die "intend needs a one-line expectation summary"
   local h; h="$(cmd_handoff "$project" "$agent")"
-  python3 - "$h" "$summary" "$(date +%H:%M)" <<'PYEOF'
+  # non-fatal on purpose (cmd_new calls this and must still scaffold), but never silent.
+  python3 - "$h" "$summary" "$(date +%H:%M)" <<'PYEOF' || echo "warn: ch intend — write-ahead block NOT updated; handoff untouched" >&2
 import sys, re
 path, summary, ts = sys.argv[1], sys.argv[2], sys.argv[3]
 s = open(path).read()
 block = f"## In flight (write-ahead)\n{ts} — {summary}\n"
 if "## In flight (write-ahead)" in s:
-    s = re.sub(r"## In flight \(write-ahead\)\n(?:(?!\n## ).*\n)*", block, s, count=1)
+    # lambda replacement: a literal replacement string would interpret backslash escapes,
+    # so an expectation containing e.g. \x raises re.error: bad escape (auditor 59246815).
+    s = re.sub(r"## In flight \(write-ahead\)\n(?:(?!\n## ).*\n)*", lambda _m: block, s, count=1)
 else:
     s = s.replace("## Mid-flight", block + "\n## Mid-flight", 1) if "## Mid-flight" in s else s + "\n" + block
 open(path, "w").write(s)
@@ -1104,7 +1107,7 @@ artifacts are pulled+verified and you tear it down.
 - **Box spec:** <e.g. 1x A100 PCIe / 1x4090 / high-RAM CPU box / N vCPU + M GB system RAM>
 - **Gates:** <data-presence, disk, CUDA op, whatever must pass before the real run>
 - **Smoke command + evidence:** <2-min exact command incl. scoring; paste the smoke result>
-- **ETA:** <hours>   **Projected cost:** <\$/hr × ETA = \$total> (the box \$/hr must sit under the \$1.50/hr account cap; over it is hard-blocked and needs David to raise the cap)
+- **ETA:** <hours>   **Projected cost:** <\$/hr × ETA = \$total> (the box \$/hr must sit under the \$1.50/hr POLICY line — agent-enforced, NOT a vendor block; the account limit is \$80/hr and cannot be lowered, so nothing stops an over-policy box but this gate. Over the line needs the operator's explicit decision, routed via the researcher; there is no cap to "raise".)
 
 ## What I need next
 tech-support: verify the box (cgroup read, nvidia-smi if GPU, disk), provision, register it
@@ -1138,10 +1141,9 @@ registered_pod_ids() { # every podId currently registered on the bus (one per li
   done
 }
 # ── email notifications ──────────────────────────────────────────────────────
-# A local SES sender so a bus event the OPERATOR must see reaches the operator's inbox even
-# when no Claude session is watching the terminal. Uses an SES identity you have already
-# verified (set CHANNELS_NOTIFY_FROM/TO, CHANNELS_AWS_PROFILE, CHANNELS_SES_REGION) — no new
-# infra to deploy. Throttled per-key so a monitor firing every 2 minutes cannot spam identical
+# A local SES sender so a bus event the OPERATOR must see reaches their inbox even when no
+# Claude session is watching the terminal. Reuses an existing verified SES identity (set
+# CHANNELS_NOTIFY_FROM/TO and CHANNELS_AWS_PROFILE) — no new AWS infra to deploy. Throttled per-key so a monitor firing every 2 minutes cannot spam identical
 # emails; the first breach mails immediately, repeats inside the window are suppressed (logged).
 notify_dir() { echo "$ROOT/.notify"; }   # local-only state (gitignored), not bus history
 cmd_notify() { # ch notify [--key <k>] [--throttle <min>] <subject> [body...]   (body from stdin if omitted)
@@ -1271,7 +1273,7 @@ for r in rows: print(r)
     echo "  ⛔⛔ BURN CEILING BREACHED — \$$burn/hr EXCEEDS the \$$burn_cap/hr ceiling. Per operator rule,"
     echo "      a job over \$$burn_cap/hr is WRONG and must be REDONE right-sized (nvidia-smi it: idle GPUs"
     echo "      on a GPU box = the cause). Right-size or kill NOW; do not let it run."
-    # Email David directly — this must reach him even when no session is watching the terminal.
+    # Email the operator directly — this must reach him even when no session is watching the terminal.
     # Throttled (key=burn-breach) so a 120s monitor loop mails once per window, not every poll.
     cmd_notify --key burn-breach \
       "⛔ BURN CEILING BREACHED: \$$burn/hr (cap \$$burn_cap) on $run pod(s)" \
