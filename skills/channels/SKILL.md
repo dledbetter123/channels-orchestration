@@ -753,14 +753,25 @@ out-of-date lie. That is why the staleness check exists, and why it names you pu
     check of it ran through the shell function and came back green, and only reading the writer's
     six-hours-earlier message corrected it.
 
-12. **A verdict about an EXTERNAL system needs TWO reads, and neither is the starting one.**
-    (auditor `64484f31`.) **A delta is a difference between two documents.** Reading one of them
-    thoroughly is what makes a half-delta feel finished:
+12. **A verdict about A DIFFERENCE BETWEEN TWO DOCUMENTS needs TWO reads, and neither is the
+    starting one.** (auditor `64484f31`, scope widened `ff10789d`.) Reading one of them thoroughly
+    is what makes a half-delta feel finished:
+
+    ⛔ **Scope this by the SHAPE OF THE CLAIM, never by the OWNER OF THE ARTIFACT.** The rule first
+    said "an external system", and its own author broke it twenty minutes later with no external
+    system anywhere in it: a ruling on whether a *draft* edit set left a contradiction standing in
+    the *shipped* thesis. Both documents ours, both on this machine, both at committed coordinates,
+    one of them unread, and a coordinate line saying otherwise (withdrawn at `6b9f45c9`). ⭐⭐ **A
+    delta gate scoped by whose document it is will miss every delta inside one party's own work** —
+    and draft-versus-shipped is the case we run all day, which had no rule, while the external-paper
+    case, which comes up weekly, had two.
 
     - **Arm A — the external artifact at METHOD-AND-TABLE grain**, not its abstract. An abstract
       states a result; only the method and tables state the **conditions**, and the conditions are
       the delta.
-    - **Arm B — OUR corpus, grepped for the external system's NAME, at a committed coordinate.**
+    - **Arm B — the OTHER document**, grepped for the term the claim turns on, at a committed
+      coordinate. (For an external system that is our corpus grepped for its name; for a
+      draft-versus-shipped delta it is the half you did not open.)
 
     ⛔ **The load-bearing clause is the finding/remedy split. One arm may report a FINDING. It must
     never propose a REMEDY**, because a remedy is a claim about the document you did not read. The
@@ -799,7 +810,7 @@ out-of-date lie. That is why the staleness check exists, and why it names you pu
     ```
     DELTA ARM B   sweepgate --at 85126bb --pattern 'ProvFusion'  -> 19 occurrences on 19 lines
                   git grep -F -o -n ProvFusion 85126bb -- '*.tex'
-    DELTA ARM A   2604.14685   NOT READ BY ME.  DERIVED from <sha> [, <sha>]
+    DELTA ARM A   2604.14685   NOT READ BY ME.  DERIVED from <sha> §N [, <sha> §N]
                                CONDITION RELIED ON: <the one you are leaning on>
     ```
 
@@ -810,11 +821,17 @@ out-of-date lie. That is why the staleness check exists, and why it names you pu
     same message: *"this does NOT license that I should read the paper."* They were right the second
     time.)
 
-    - **Name a SHA, never a lane** — it points at a *read*, not at a reputation, and it makes the
-      dependency greppable: when a source read is revised, every remedy leaning on it can be
-      **found** instead of remembered.
+    - **Name a SHA and a SECTION — `<sha> §N`, never a bare sha and never a lane.** A sha points
+      at a *read* rather than a reputation, and makes the dependency greppable: a revised source
+      read can be **found** instead of remembered. ⛔ **But the section is not optional bookkeeping.
+      A MESSAGE IS NOT AN ATOM — it can be half-withdrawn, and one was, four hours before it was
+      cited.** The first use of `DERIVED` on this bus wrote `e5a882e2 §2` by instinct, and had to:
+      `e5a882e2` §1 was withdrawn in full at `6b9f45c9` while §2 stood. At message grain that
+      citation would today point at a public withdrawal with no way for a reader to tell it missed
+      the half being leaned on. ⭐⭐ **A provenance pointer inherits the grain of the thing it points
+      at, and the greppability does not survive its first withdrawal at message grain.**
     - **Sits below arm B**, for the same reason `ATTESTED` does.
-    - ⚠️ **Its honest limit, stated in the rule rather than under it: `DERIVED <sha>` proves which
+    - ⚠️ **Its honest limit, stated in the rule rather than under it: `DERIVED <sha> §N` proves which
       read licenses the remedy. It does NOT prove that read covered the condition you are leaning
       on.** That is why the `CONDITION RELIED ON` line is part of the state and not decoration.
 
