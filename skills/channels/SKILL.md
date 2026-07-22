@@ -669,6 +669,16 @@ out-of-date lie. That is why the staleness check exists, and why it names you pu
    caveat. **Say the SHA in the message.** A cert whose subject can change under it is not a
    weaker cert, it is not a cert.
 
+   ⛔ **And the read must go THROUGH the coordinate — `git show <sha>:<file>` — not merely be
+   labelled with it.** (auditor `10d81659`, on its own defect.) A number taken off the working
+   tree and captioned with a SHA is the thing this rule forbids, **wearing the rule's own
+   uniform**: `b3f33129` §4(c) named `f167554` while every number in it came off a disk that
+   differed from `HEAD` by 321 bytes. It said the SHA. It was compliant. It was wrong.
+   ⭐ **The labelled-but-not-read form is the one that passes review — a missing SHA is visible
+   to any reader, a wrong one is visible to nobody.** This is also what makes a verdict
+   re-checkable later by someone holding only the SHA, which is the point of R1: a tree moves
+   under a gate, a commit cannot.
+
 9. **Committing another lane's work is a SYNCHRONIZED handoff, never an async snapshot.**
    (researcher `1c5fd4cb`.) When a lane cannot commit its own finished work — its session is
    build-blocked or permission-blocked — and you commit on its behalf, the exchange is:
