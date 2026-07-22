@@ -347,6 +347,34 @@ cmd_send() { # ch send <project> <channel> <slug> <subject...>
   # kill the send silently. Absorb it.
   field() { grep -E "^$1:" "$ROOT/$rel/MESSAGE.md" 2>/dev/null | head -1 | cut -d: -f2- \
               | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | tr -d '"' || true; }
+
+  # ── IDENTITY: the `from:` FIELD overrides the lane DIRECTORY, and nothing checked it ────────
+  # deliver() takes `from` from the body (`from="${from:-$channel}"` at cmd_send's caller), and
+  # :497/:752 re-read it for inbox and board attribution. So hand-written or copy-pasted front
+  # matter can publish under ANOTHER lane's name while the commit path still says yours. Both
+  # failure directions are silent and both were caught by eye rather than by a guard on 07-22
+  # (tech-support's own scaffold clobber; auditor 3a3a071f). Reproduced on an isolated bus:
+  #   addressed TO the lane you name in from:  → recipients_of() skips `from` (:586), so it is
+  #       "delivered to: NOBODY", which the sender reads as an ADDRESSING mistake, not an
+  #       identity one. The honest control on the same bus delivered fine.
+  #   addressed to anyone else                 → it delivers, and the two records DISAGREE: the
+  #       mailbox shows the channel from the PATH, board/catchup show the FIELD.
+  # Audited across 1101 live messages: exactly ONE pre-existing mismatch, `hids-research/writer/
+  # 2026-07-14-dispatch-contribution1-final` carrying `from: researcher`, whose commit therefore
+  # reads `writer(...) [asks writer] [asks writer]` — an ask recorded from a lane to itself.
+  # REFUSE rather than warn: on an append-only bus a wrong record is not correctable, only
+  # annotatable, and a warning at send time is read after the decision to send is already made.
+  # Equality ALONE would go red on every worker, and an alarm that fires on a correct message is
+  # worse than no alarm, so the worker form is accepted explicitly (see the header note at :28).
+  # An EMPTY from: is fine — deliver() falls back to the channel, which is this same predicate.
+  local decl; decl="$(field from)"
+  if [ -n "$decl" ] && [ "$decl" != "$channel" ] && ! [[ "$decl" =~ ^"$channel"#[0-9]+$ ]]; then
+    die "from: says '$decl' but this message lives in the '$channel' lane.
+    The field WINS over the directory: readers would see '$decl' as the author, and if you have
+    addressed '$decl' it is delivered to NOBODY, because a lane is never a recipient of itself.
+    Fix the from: field (or send from the '$decl' lane). Accepted: '$channel' or '$channel#<n>'."
+  fi
+
   local tag="" prom res asks re
   prom="$(field promises)"; res="$(field resolves)"
   asks="$(field asks)";     re="$(field re)"
