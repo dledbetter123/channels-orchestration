@@ -898,6 +898,51 @@ out-of-date lie. That is why the staleness check exists, and why it names you pu
     lane's wording change, state the CONDITION, not only the finding.** One line. The borrower
     cannot ask for a condition they do not know exists.
 
+    ### A claim of NOVELTY is a claim about the RECORD
+
+    (form: researcher `c260c286`; the re-derivation half: writer; two worked failures volunteered by
+    the auditor, `6b9f45c9` and `132ad60d`.)
+
+    ⭐⭐ **"Not ruled before", "first", "new", "nobody has swept this", "there is no SHA to point you
+    at" are VERDICTS ABOUT A DIFFERENCE BETWEEN TWO DOCUMENTS, and the second document is the log.
+    Read the log before asserting any of them.** The arm is `CHECKED`: the record is ours, at a
+    committed SHA, so a novelty claim can carry a re-runnable line instead of an assertion of
+    diligence.
+
+    ⛔ **Why it needs saying separately, when the trigger above already covers it on a strict
+    reading:** every worked example attached to the trigger is two pieces of SUBJECT MATTER. The log
+    is not subject matter, it is provenance, the thing a lane consults *about* its work rather than
+    *as* its work. So "have I read both documents" gets answered yes by someone who never counted the
+    record as a document. ⚠️ **A novelty claim is also the one claim a reader cannot falsify from the
+    message.** Every other line in a verdict can be checked against the document it is about; "nobody
+    ruled this" can only be checked against a log the reader has to go find.
+
+    ⛔⛔ **AND THE OBVIOUS ARM DOES NOT FIRE ON THE MISS IT IS PROPOSED TO PREVENT. `git log --oneline
+    | grep <token>` SEARCHES SUBJECT LINES. RULINGS LIVE IN MESSAGE BODIES.** Verified at the
+    coordinate: run against the record as it stood at the moment of the miss, that arm returned three
+    hits for `Chapter7.tex:176`, all three being the message the author was replying to, while
+    `3c55439b`, the four-hour-old ruling actually missed, was absent. Its subject line carries none
+    of `Chapter7.tex:176`, `:176`, or `possessive` (0, 0, 0). A subject-line token fires the same arm
+    three times, so the arm was live, and it was still blind.
+
+    ```
+    ⛔ git log --oneline | grep -i '<token>'          subject lines only. MISSES the ruling.
+    ✅ git grep -F -n '<token>' -- 'hids-research/*/MESSAGE.md'      message BODIES. Finds it.
+    ✅ git log -S'<token>' --oneline -- 'hids-research/*'            when the token was introduced.
+    ```
+
+    ⭐⭐ **THE FORM: AN ARM THAT RETURNS THE CONVERSATION YOU ARE ALREADY IN READS AS A RECORD CHECK
+    WHILE CHECKING ONLY THE LAST FEW MINUTES.** That is worse than a zero. A zero prompts a second
+    look; a handful of familiar hits confirms diligence and closes the question. ⭐ **So the positive
+    control for a novelty claim is not "does the arm return something". It is "does the arm reach
+    back past the thread I am in".** Fire it on a token from a message you already know is old.
+
+    ⚠️ **The reason the class matters more than a duplicate ruling: both record-blind verdicts here
+    were CORRECT.** The defect was never the verdict, it was the LESSON drawn from believing it was
+    first, and the lesson is the artifact that gets copied forward. **A re-derivation is invisible to
+    itself, and worse, it is CONFIRMING**, because reaching the identical verdict from the identical
+    falsifier feels like independent corroboration.
+
     This is a message-SHAPE rule, deliberately not a hook: nothing can verify arm A, and an alarm
     that fires on correct verdicts is worse than no alarm.
 
