@@ -167,7 +167,7 @@ ensure_subs() { # <agent> — seed the subscription file on first use
   default_subs "$agent" | tr ' ' '\n' | grep -v '^$' > "$f"
   git_retry add -- ".subs/$agent" 2>/dev/null || true
   git -C "$ROOT" diff --cached --quiet -- ".subs/$agent" 2>/dev/null || \
-    git_retry commit -q -m "subscribe($agent): $(tr '\n' ' ' < "$f")" 2>/dev/null || true
+    git_retry commit -q -m "subscribe($agent): $(tr '\n' ' ' < "$f")" -- ".subs/$agent" 2>/dev/null || true
 }
 
 # NEITHER of these seeds. Asking "is the writer subscribed?" must not SUBSCRIBE the writer —
@@ -189,7 +189,7 @@ cmd_subscribe() { # ch subscribe <agent> <channel>
   if subscribed_to "$agent" "$chan"; then echo "$agent already subscribes to $chan"; return 0; fi
   echo "$chan" >> "$ROOT/.subs/$agent"
   git_retry add -- ".subs/$agent"
-  git_retry commit -q -m "subscribe($agent): + $chan"
+  git_retry commit -q -m "subscribe($agent): + $chan" -- ".subs/$agent"
   # Subscription starts delivery HERE. It does not hand you the channel's past: you were not
   # subscribed then, so that mail was never yours. `git log -- <project>/<chan>` if you want
   # the history; the mailbox is for what was addressed to you while you were listening.
@@ -202,7 +202,7 @@ cmd_unsubscribe() { # ch unsubscribe <agent> <channel>
   subscribed_to "$agent" "$chan" || { echo "$agent does not subscribe to $chan"; return 0; }
   grep -vx "$chan" "$ROOT/.subs/$agent" > "$ROOT/.subs/$agent.tmp" && mv "$ROOT/.subs/$agent.tmp" "$ROOT/.subs/$agent"
   git_retry add -- ".subs/$agent"
-  git_retry commit -q -m "unsubscribe($agent): - $chan"
+  git_retry commit -q -m "unsubscribe($agent): - $chan" -- ".subs/$agent"
   echo "$agent no longer subscribes to $chan"
 }
 
@@ -256,7 +256,7 @@ open(path, "w").write(s)
 PYEOF
   git_retry add -- "$project/$agent/HANDOFF.md"
   git -C "$ROOT" diff --cached --quiet -- "$project/$agent/HANDOFF.md" || \
-    git_retry commit -q -m "intend($project/$agent): $summary"
+    git_retry commit -q -m "intend($project/$agent): $summary" -- "$project/$agent/HANDOFF.md"
   echo "intent recorded: $summary"
 }
 
@@ -280,7 +280,7 @@ open(path, "w").write(s)
 PYEOF
   git_retry add -- "$project/$agent/HANDOFF.md"
   git -C "$ROOT" diff --cached --quiet -- "$project/$agent/HANDOFF.md" || \
-    git_retry commit -q -m "note($project/$agent): $line"
+    git_retry commit -q -m "note($project/$agent): $line" -- "$project/$agent/HANDOFF.md"
   echo "noted"
 }
 
@@ -332,6 +332,9 @@ EOF
 }
 
 cmd_send() { # ch send <project> <channel> <slug> <subject...>
+  # arity FIRST: set -u made a bare `ch send` die on "$1: unbound variable", which reads as a
+  # bus crash rather than a usage error — and left the caller's files staged (auditor 1ce1e880).
+  [ "$#" -ge 4 ] || die "usage: ch send <project> <channel> <slug> <subject...>"
   local project="$1" channel="$2" slug="$3"; shift 3
   local subject="$*"
   [ -n "$subject" ] || die "send needs a one-line subject"
@@ -403,8 +406,12 @@ cmd_send() { # ch send <project> <channel> <slug> <subject...>
   # asks already closed (researcher f9b67fa; worsened as the log grew). Tokens are the short
   # shas inside any [re <sha>] / [resolves <sha>] tag in history.
   local closed_tokens
+  # `|| true`: with `set -o pipefail`, grep finding NOTHING exits 1, the whole pipeline exits 1,
+  # the assignment fails, and `set -e` kills the send with NO output at all — exit 1, silence.
+  # Zero matches is the normal state of a fresh bus (no [re]/[resolves] tag in history yet), so
+  # every FIRST send on a new project died silently. Absorb it.
   closed_tokens="$(git -C "$ROOT" log --format=%s | grep -oE '\[(re|resolves) [0-9a-f]+\]' \
-                     | awk '{print $2}' | tr -d ']')"
+                     | awk '{print $2}' | tr -d ']' || true)"
   local rf rf_full rf_sub open_unclosed="" tok already
   for rf in $refs_field; do
     git -C "$ROOT" cat-file -e "$rf^{commit}" 2>/dev/null || continue
@@ -451,7 +458,7 @@ cmd_send() { # ch send <project> <channel> <slug> <subject...>
   fi
 
   git_retry add -- "$rel"
-  git_retry commit -q -m "$channel($project): $slug — $subject$tag"
+  git_retry commit -q -m "$channel($project): $slug — $subject$tag" -- "$rel"
   # Capture the sha NOW. cmd_intend/cmd_note below each commit, moving HEAD, so any later
   # rev-parse names the intend commit instead of the message. That misfiled two of my own
   # messages in the running log before the `re:` guard caught it (auditor 0c02a63).
@@ -549,7 +556,7 @@ receipt_add() { # <agent> <kind> <sha>  — append only; caller commits once per
 receipt_commit() { # <agent>  — persist the log (best-effort; the append is the durable part)
   git_retry add -- ".receipts/$1" 2>/dev/null || true
   git -C "$ROOT" diff --cached --quiet -- ".receipts/$1" 2>/dev/null || \
-    git_retry commit -q -m "receipts($1): updated" 2>/dev/null || true
+    git_retry commit -q -m "receipts($1): updated" -- ".receipts/$1" 2>/dev/null || true
 }
 # The set of shas this agent has ACKED, from BOTH the log and the legacy file (for callers that
 # need the whole set at once, e.g. the board's unread count).
@@ -633,7 +640,7 @@ deliver() { # <sha> <channel> <from> <subs-csv> <subject>
     # five times and shouting. Best-effort commit, never fatal.
     git -C "$ROOT" add -- ".mail" 2>/dev/null || true
     if ! git -C "$ROOT" diff --cached --quiet -- ".mail" 2>/dev/null; then
-      git -C "$ROOT" commit -q -m "mail: deliver $sha →$(echo "$got" | tr ' ' ',' | sed 's/^,//')" 2>/dev/null \
+      git -C "$ROOT" commit -q -m "mail: deliver $sha →$(echo "$got" | tr ' ' ',' | sed 's/^,//')" -- ".mail" 2>/dev/null \
         || echo "  (delivery written; commit deferred to a concurrent session)"
     fi
     echo "delivered to:$got"
@@ -1027,7 +1034,7 @@ cmd_pod_up() { # ch pod-up <agent> <podId> [--monitor <taskid>] [--eta <hours>] 
   printf 'launched=%s\nmonitor=%s\neta_h=%s\nnote=%s\n' "$(date +%s)" "$monitor" "$eta" "$note" > "$f"
   git_retry add -- ".pods/$agent/$pod" >/dev/null 2>&1 || true
   git -C "$ROOT" diff --cached --quiet -- ".pods/$agent/$pod" 2>/dev/null || \
-    git_retry commit -q -m "pod($agent): up $pod${monitor:+ [mon $monitor]}${eta:+ [eta ${eta}h]}${note:+ — $note}" >/dev/null 2>&1 || true
+    git_retry commit -q -m "pod($agent): up $pod${monitor:+ [mon $monitor]}${eta:+ [eta ${eta}h]}${note:+ — $note}" -- ".pods/$agent/$pod" >/dev/null 2>&1 || true
   echo "registered pod $pod for $agent${monitor:+ (monitor $monitor)}${eta:+, eta ${eta}h}. Announce it on the bus; 'ch pod-down $agent $pod' the instant it stops."
   [ -z "$monitor" ] && echo "  ⚠️  no --monitor <taskid> recorded — the board will mark this pod BARE (silent-death risk). Arm a persistent monitor, then re-run with --monitor <taskid>."
   [ -z "$eta" ] && echo "  ℹ️  no --eta <hours> declared — 'ch spend' and the board can't flag this pod when it bills past its own plan. Optional, but it makes the over-budget check precise."
@@ -1039,7 +1046,7 @@ cmd_pod_down() { # ch pod-down <agent> <podId> — deregister a stopped/terminat
   [ -f "$f" ] || { echo "no such registered pod: $agent/$pod (already down?)"; return 0; }
   git_retry rm -q -- ".pods/$agent/$pod" >/dev/null 2>&1 || rm -f "$f"
   git -C "$ROOT" diff --cached --quiet -- ".pods/$agent/$pod" 2>/dev/null || \
-    git_retry commit -q -m "pod($agent): down $pod" >/dev/null 2>&1 || true
+    git_retry commit -q -m "pod($agent): down $pod" -- ".pods/$agent/$pod" >/dev/null 2>&1 || true
   echo "deregistered pod $pod for $agent. Confirm zero pods remain: ch pods"
 }
 cmd_pods() { # ch pods — every registered running pod across all lanes (the shared-account view)
@@ -1262,7 +1269,7 @@ for r in rows: print(r)
     "$now" "$bal" "$burn" "$total" "$run" "$unreg" > "$(spend_cache)"
   git_retry add -- ".pods/.spend" >/dev/null 2>&1 || true
   git -C "$ROOT" diff --cached --quiet -- ".pods/.spend" 2>/dev/null || \
-    git_retry commit -q -m "spend: \$$burn/hr, \$$total on $run running pod(s)${unreg:+, $unreg unregistered}" >/dev/null 2>&1 || true
+    git_retry commit -q -m "spend: \$$burn/hr, \$$total on $run running pod(s)${unreg:+, $unreg unregistered}" -- ".pods/.spend" >/dev/null 2>&1 || true
   # human output
   printf 'spend: $%s/hr live burn · $%s cumulative on %s running pod(s) · balance $%s (auto-recharges)\n' "$burn" "$total" "$run" "$bal"
   # HARD BURN CEILING (operator directive 2026-07-18): aggregate burn over $5/hr means a job is
@@ -1664,7 +1671,7 @@ skill_mark() { # <agent> — record that this agent is CURRENT at the currency V
   echo "$ver" > "$(skill_seen "$1")"
   git_retry add -- ".skill/seen/$1" >/dev/null 2>&1 || true
   git -C "$ROOT" diff --cached --quiet -- ".skill/seen/$1" 2>/dev/null || \
-    git_retry commit -q -m "skill($1): loaded $ver" >/dev/null 2>&1 || true
+    git_retry commit -q -m "skill($1): loaded $ver" -- ".skill/seen/$1" >/dev/null 2>&1 || true
 }
 skill_warn() { # <agent> — print the loud banner if their protocol is behind
   skill_stale "$1" || return 0
@@ -1700,7 +1707,7 @@ cmd_skill_bump() { # ch skill-bump [--minor] "<one line: what changed>" — tech
   echo "$cur" > "$ROOT/.skill/VERSION"
   git_retry add -- ".skill/VERSION" ".skill/NOTE"
   git -C "$ROOT" diff --cached --quiet -- ".skill/VERSION" ".skill/NOTE" || \
-    git_retry commit -q -m "skill[MAJOR]: $note"
+    git_retry commit -q -m "skill[MAJOR]: $note" -- ".skill/VERSION" ".skill/NOTE"
   local a stale=""
   for a in "${AGENTS[@]}"; do skill_stale "$a" && stale="$stale $a"; done
   echo "skill bumped (MAJOR) — currency VERSION now $cur"
