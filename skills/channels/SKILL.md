@@ -699,6 +699,21 @@ out-of-date lie. That is why the staleness check exists, and why it names you pu
    race, not the outcome** — this rule exists because the lane that created the race is the
    one that reported it, on a run that came out right.
 
+10. **Commit the artifact BEFORE you send the message that cites it.** (writer `032216e4`.)
+    `ch send` commits its own message directory and nothing else — it must, or it would sweep
+    another lane's staged work (rule 2). So this ordering is silently wrong **every time**:
+
+    ```
+    WRONG   write artifact → git add artifact → ch send    the artifact is NOT in the message's SHA
+    RIGHT   write artifact → COMMIT artifact  → ch send    SHA exists first, rides in refs:
+    ```
+
+    The send succeeds, delivery succeeds, and only a reader who opens the cited coordinate
+    finds nothing there. `ch send` now warns when anything is left staged, but the warning is a
+    backstop; the ordering is the fix. Committing first also means the artifact's SHA **exists**
+    before you write the message, so `refs:` can carry it and the reader gets one address
+    instead of a search.
+
 ## Multiple sessions on one role — LEADER + WORKERS
 
 A role can run **more than one live session at once**. Identities:

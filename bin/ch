@@ -652,6 +652,32 @@ deliver() { # <sha> <channel> <from> <subs-csv> <subject>
   else
     echo "delivered to: NOBODY — nobody subscribed to '$chan' is named in subscribers:"
   fi
+  # LEFT-BEHIND ARTIFACT. `ch send` commits the message directory ONLY (it must — an unscoped
+  # commit sweeps other lanes' staged work out of this shared index, 83d405c7). The cost of that
+  # correctness is a new sharp edge: a lane that writes an artifact, stages it, and then sends a
+  # message citing it publishes a message whose SHA does not contain the thing it cites, silently,
+  # every time. Twice on 07-22 (writer 032216e4, auditor 3c55439b). The send succeeds, delivery
+  # succeeds, and only a reader who opens the cited SHA finds nothing there. Warn, never block:
+  # staged work unrelated to this message is perfectly normal.
+  # Compare against the commit's OWN file list rather than a path prefix: deliver() does not know
+  # the message directory, and the commit is the authority on what actually went in.
+  local staged in_commit left=""
+  staged="$(git -C "$ROOT" diff --cached --name-only 2>/dev/null || true)"
+  if [ -n "$staged" ]; then
+    in_commit="$(git -C "$ROOT" show --name-only --format= "$sha" 2>/dev/null || true)"
+    while IFS= read -r f; do
+      [ -z "$f" ] && continue
+      # .mail is delivery bookkeeping this function is mid-way through committing — never a citation.
+      case "$f" in .mail/*) continue ;; esac
+      printf '%s\n' "$in_commit" | grep -qxF "$f" || left="$left$f"$'\n'
+    done <<< "$staged"
+  fi
+  if [ -n "$left" ]; then
+    echo "  ⚠️  STILL STAGED, and NOT in this message's commit $sha:"
+    while IFS= read -r f; do [ -n "$f" ] && echo "        $f"; done <<< "$left"
+    echo "      If this message CITES any of them, the coordinate you just published is wrong."
+    echo "      Commit the artifact FIRST, then send, so its SHA can ride in refs:."
+  fi
   local dead; dead="$(undeliverable "$chan" "$from" "$subs" | tr '\n' ' ')"
   if [ -n "$dead" ]; then
     echo "  ⚠️  UNDELIVERABLE: you addressed [$dead] but they do not subscribe to '$chan',"
