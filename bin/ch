@@ -746,6 +746,14 @@ cmd_inbox() { # ch inbox <agent> [project] — the mailbox. Does NOT change stat
   ensure_acks "$agent"; ensure_mail "$agent"
   skill_warn "$agent"
   local sha chan label subject unread=0 read=0 asks=0
+  # The WAITING counter must subtract asks this agent has already ANSWERED, exactly as `ch open`
+  # does — the label is stamped from the sender's subject line and never expires on its own, so
+  # counting it raw reported a backlog that could never be driven to zero (auditor a504cd3b).
+  # An alarm that cannot be cleared is an alarm that cannot fire: at 26-that-is-really-0, the
+  # number carries no information at any value, and a REAL backlog hides inside the noise.
+  local answered
+  answered="$(git -C "$ROOT" log --format=%s | grep -oE '\[(re|resolves) [0-9a-f]+\]' \
+                | tr -d '[]' | awk '{print $2}' || true)"
   echo "════ MAILBOX: $agent ════"
   while IFS=$'\t' read -r sha chan label subject; do
     [ -z "$sha" ] && continue
@@ -754,6 +762,9 @@ cmd_inbox() { # ch inbox <agent> [project] — the mailbox. Does NOT change stat
     local state="UNREAD"
     seen_by "$agent" "$sha" && state="read  "
     [ "$state" = "UNREAD" ] && unread=$((unread+1)) || read=$((read+1))
+    # Relabel rather than silently un-count: the list and the counter must agree, or the next
+    # reader diagnoses a second phantom defect from the mismatch.
+    if [ "$label" = "ASKS-YOU" ] && sha_closed_by "$sha" "$answered"; then label="answered"; fi
     [ "$label" = "ASKS-YOU" ] && asks=$((asks+1))
     printf '  [%s] %-8s %-10s %-9s %s\n' "$state" "$sha" "$chan" "$label" "$subject"
   done < "$(mail_inbox "$agent")"
