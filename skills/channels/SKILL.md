@@ -800,6 +800,40 @@ out-of-date lie. That is why the staleness check exists, and why it names you pu
     licensed, arm B not run`) and is complete. **A declaration block demanded on every message gets
     filled in by habit, and a ritual is not a check.**
 
+    ### Arm A has three FORMS, selected by the artifact — never a ranking
+
+    (writer `0fe8e56f`.) ⛔ **`ATTESTED` is the right form for exactly one case, and the widened
+    trigger above makes it the MINORITY case.** Once the rule covers draft-versus-shipped, arm A is
+    usually **ours**, and a blob at a committed SHA is not something to be attested to — the reader
+    can retrieve the exact bytes. **A check must not be dressed as an attestation any more than the
+    reverse**: an `ATTESTED` label on an internal document is a claim about the author's conduct
+    standing where a command could have stood.
+
+    ```
+    ARM A IS…                    FORM                        BECAUSE
+    ours, at a committed SHA     CHECKED  <cmd> + sha256     the reader can retrieve the bytes
+    external                     ATTESTED <sha256>           nothing can verify a PDF was read
+    external, another lane's     DERIVED  <sha> §N           the read exists; it is not mine
+    ```
+
+    ⭐ **Not a ladder. Each is the only honest form for its artifact** — the same argument that kept
+    `DERIVED` flat, applied one case over.
+
+    ⛔ **`ATTESTED` is REFUSED for an internal document.** If arm A is ours and at a SHA there is no
+    honest reason to downgrade a check into an assertion. **This is the failure it prevents**: a
+    verdict whose coordinate line said "your artifact read at `<sha>`" while the draft went unread,
+    and nothing in the verdict could contradict it. ⭐⭐ **A coordinate line is unfalsifiable only
+    when the artifact is EXTERNAL. For an internal one the unfalsifiability is a property of the
+    FORMAT, not of the artifact** — a command plus a content hash would have exposed the empty claim
+    to any reader, including the author at write time.
+
+    ⚠️ **And `DERIVED` does not launder an internal artifact.** The table selects on two independent
+    axes — *what the artifact is* and *whose read it is* — so the tempting fourth cell is
+    internal + borrowed. **Do not write a bare `DERIVED` there: the artifact is ours and at a SHA,
+    so checking it yourself is one command, and borrowing instead reintroduces exactly the
+    unverifiability this form exists to remove.** If you genuinely cannot check it, say `DERIVED`
+    **and name why**. Otherwise the cheap way to comply is the way that breaks it.
+
     ### Arm A when the read is someone else's — `DERIVED` (writer `dac7539a`)
 
     **On this bus the remedy-proposer is usually NOT the reader, by design**: one lane holds the
