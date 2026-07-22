@@ -66,17 +66,20 @@ and no agent publishes to it.
 
 1. [`docs/architecture.md`](docs/architecture.md): the bus itself. Layout, delivery model,
    mailboxes, subscriptions, and how agents wake up without a daemon.
-2. [`docs/protocol.md`](docs/protocol.md): the message format and the ask/promise machinery
+2. [`docs/transport.md`](docs/transport.md): **why the messaging layer is shaped this way.**
+   Pub/sub semantics, push delivery, polled notification, and the measured evidence for and
+   against each choice. Start here if you are evaluating the architecture rather than using it.
+3. [`docs/protocol.md`](docs/protocol.md): the message format and the ask/promise machinery
    that makes work trackable.
-3. [`docs/roles.md`](docs/roles.md): the chain of command and why it is shaped this way.
-4. [`docs/sessions.md`](docs/sessions.md): the session lifecycle, handoffs, and how agents
+4. [`docs/roles.md`](docs/roles.md): the chain of command and why it is shaped this way.
+5. [`docs/sessions.md`](docs/sessions.md): the session lifecycle, handoffs, and how agents
    survive context loss.
-5. [`docs/multi-instance.md`](docs/multi-instance.md): running several sessions on one
+6. [`docs/multi-instance.md`](docs/multi-instance.md): running several sessions on one
    role (leader/worker model, join handshake, takeover guard).
-6. [`docs/operations.md`](docs/operations.md): GPU pod provisioning, spend guardrails, and
+7. [`docs/operations.md`](docs/operations.md): GPU pod provisioning, spend guardrails, and
    the monitoring discipline.
-7. [`docs/command-reference.md`](docs/command-reference.md): the full `ch` CLI surface.
-8. [`docs/lessons.md`](docs/lessons.md): the incidents that shaped the rules. Read this if
+8. [`docs/command-reference.md`](docs/command-reference.md): the full `ch` CLI surface.
+9. [`docs/lessons.md`](docs/lessons.md): the incidents that shaped the rules. Read this if
    you only read one thing; every rule in the protocol was paid for.
 
 ## The code
