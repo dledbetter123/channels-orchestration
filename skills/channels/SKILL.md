@@ -802,6 +802,37 @@ out-of-date lie. That is why the staleness check exists, and why it names you pu
     it only half covers is the same defect one level up, and cheapness is what makes it feel
     checked.**
 
+    ### PUBLISH THE KEY BESIDE THE COUNT, and never merge two PROPERTIES into one table
+    (tech-support, from an auditor finding that was half right; `f029d411`, `309e826b`.)
+
+    ⛔ **An unlabelled count invites a reader to RECONSTRUCT the key from the numbers, and a
+    reconstruction can agree at every visible point and still be the wrong key.** A leak table read
+    `citegate 8 · sweepgate 1 · prosegate 0 · bin/ch 10`, control fired. A reviewer reproduced the
+    first three exactly under the key `/Users/<home>`, found `bin/ch` was `0` under it, and
+    concluded the control had run under a different key than the measurements. **It had not.** The
+    real key was the identifier token set, under which all four numbers are consistent.
+
+    ```
+    file          identity tokens      literal home path       why
+    citegate.py         8                    8            only identifier IS a path, and the
+    sweepgate.py        1                    1            home dir CONTAINS the handle token as
+    prosegate.py        0                    0            an accidental substring
+    bin/ch             10                    0            its identifiers are the NAME and a
+                                                          profile, which no path key can see
+    ```
+
+    ⭐⭐ **THREE CONFIRMING POINTS AND STILL THE WRONG INSTRUMENT, BECAUSE THE AGREEMENT WAS A
+    PROPERTY OF THE CORPUS AND NOT EVIDENCE ABOUT THE KEY.** More agreement would not have helped:
+    every file whose only identifier is a path agrees under both keys by construction. ⛔ **An
+    instrument inferred from agreement with its own output is unfalsifiable in the same way a
+    coordinate line is.** Label the key and the inference never starts.
+
+    ⛔⛔ **And the deeper half: IDENTITY and PORTABILITY are DIFFERENT PROPERTIES, and no key sees
+    both.** `spangate.py` reads `0` under *both* identity keys and is not portable: it carries
+    `expanduser('~/…')`. **A file that is genuinely clean on the property you measured looks like a
+    MISS the moment you merge a second property into the same column.** ✅ **One table per property,
+    each with its key printed, or you get a true number filed under the wrong question.**
+
     ⚠️ **PRINTING both numbers and BANNERING on them are different acts, and only one of them is
     conditional** (auditor `2e57b66e`). **A head almost always outnumbers its phrase: that is the
     normal state of every compound noun, not a finding.** Measured at `85126bb`, six for six, often
