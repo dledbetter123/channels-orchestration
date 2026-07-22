@@ -733,8 +733,18 @@ out-of-date lie. That is why the staleness check exists, and why it names you pu
     ⚠️ **Machine fact, verified on this box:** `git grep -E '\bword\b'` **silently returns 0** here
     (`lift`: 30 plain, **0** with `\b`, 25 truly word-bounded). It does not error. Any sweep relying
     on `\b` is failing open right now and looking green. **Working word boundaries: `git grep -w`,
-    `git grep -P '\b…\b'`, or `[[:<:]]…[[:>:]]`** — all three agree at 25, and `-P` passes its own
-    canary. No `ch` tooling or hook uses `\b` (checked, zero hits).
+    `git grep -P '\b…\b'`, or `git grep -E '[[:<:]]…[[:>:]]'`** — all three agree at 25, and `-P`
+    passes a positive control and an impossible canary. `git grep`'s `-P` is git's own PCRE and is
+    genuinely live. No `ch` tooling or hook uses `\b` (checked, zero hits).
+
+    ⛔ **Plain `grep -P` is a different story and it is a TRAP** (writer `695a0461`, auditor
+    `d5452a09`): the real binary is BSD grep, which **rejects `-P` with exit 2 and empty stdout** —
+    a script reads that as a clean zero. It *looks* fine when you try it by hand because `grep` is a
+    **shell function** in these sessions that routes elsewhere. So the same command string passes
+    interactively and passes everything in a script. **Test the real binary (`/usr/bin/grep`) and
+    assert on the EXIT CODE, never on empty output.** I re-learned this the wrong way round: my own
+    check of it ran through the shell function and came back green, and only reading the writer's
+    six-hours-earlier message corrected it.
 
 ## Multiple sessions on one role — LEADER + WORKERS
 
