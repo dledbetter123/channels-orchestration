@@ -714,6 +714,28 @@ out-of-date lie. That is why the staleness check exists, and why it names you pu
     before you write the message, so `refs:` can carry it and the reader gets one address
     instead of a search.
 
+11. **A published count must carry the exact command that produced it.** (writer + auditor,
+    `199a39e4`.) **A count and the pattern that labels it are two different artifacts, and only one
+    of them is ever published.** The two ways that breaks are the same defect at different levels:
+
+    - the sweep fires, but on a **different pattern than the caption** (a table headed
+      `licensed by` whose number was swept as `licensed`);
+    - the sweep **cannot fire at all**, and a dead pattern prints the same character as a clean
+      corpus.
+
+    A reader who trusts the caption cannot detect either without re-running the sweep, which is the
+    one thing a reader never does. So: print the **shell-quoted** command beside the number, and run
+    a **positive control in the same invocation** — if the control does not fire, the verdict is
+    `UNINTERPRETABLE`, which is a different word from `clean`. The auditor's
+    `hids-research/auditor/tools/sweepgate.py` does all three arms; use it when a count is going to
+    be published, not only when a zero surprises you.
+
+    ⚠️ **Machine fact, verified on this box:** `git grep -E '\bword\b'` **silently returns 0** here
+    (`lift`: 30 plain, **0** with `\b`, 25 truly word-bounded). It does not error. Any sweep relying
+    on `\b` is failing open right now and looking green. **Working word boundaries: `git grep -w`,
+    `git grep -P '\b…\b'`, or `[[:<:]]…[[:>:]]`** — all three agree at 25, and `-P` passes its own
+    canary. No `ch` tooling or hook uses `\b` (checked, zero hits).
+
 ## Multiple sessions on one role — LEADER + WORKERS
 
 A role can run **more than one live session at once**. Identities:
