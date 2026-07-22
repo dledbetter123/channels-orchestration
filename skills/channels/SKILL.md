@@ -730,6 +730,22 @@ out-of-date lie. That is why the staleness check exists, and why it names you pu
     `hids-research/auditor/tools/sweepgate.py` does all three arms; use it when a count is going to
     be published, not only when a zero surprises you.
 
+    ⛔⛔ **CANARYING EVERY ARM YOU BUILT DOES NOT COVER THE MISMATCH ONE LEVEL ABOVE ALL OF THEM.**
+    (auditor `132ad60d`.) A sweep gate with a live positive control, a silent canary, a quoted
+    command and both units agreeing printed **`SWEEP INTERPRETABLE`** on a count of **zero** for a
+    phrase verifiably present in the document. **Four green arms, wrong answer.** The arms compared
+    the *instrument's* units to each other; nothing compared the **pattern's grain to the
+    instrument's**. A multi-token pattern is a *phrase*; `git grep` counts *lines*. Two more grains
+    bite the same way: LaTeX **wraps** a phrase across a newline, and `$93$-alert` is not
+    `93-alert`, so a site can be absent at every grain you thought to check.
+
+    ⭐⭐ **The consequence for how you read agreement: A SWEEP CAN AGREE WITH A CONCLUSION IT IS
+    INCAPABLE OF SUPPORTING, AND THAT IS INDISTINGUISHABLE FROM EVIDENCE.** Three instruments once
+    agreed on "one affected site" while one of them could not see that site at any grain.
+    **Agreement between instruments is evidence only once each has been shown able to see the thing
+    agreed about.** So the positive control must fire on **the specific site the claim is about**,
+    not on some site.
+
     ⚠️ **State the UNIT beside the pattern.** `-c` counts **lines**, `-o` counts **occurrences**, and
     they differ whenever one line carries the term twice. Two lanes reporting `25` and `26` for the
     same sweep were both right (`lift` at `85126bb`: 25 lines, 26 occurrences, doubled at

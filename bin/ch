@@ -245,7 +245,7 @@ cmd_intend() { # ch intend <project> <agent> "<what I am about to write>"
 import sys, re
 path, summary, ts = sys.argv[1], sys.argv[2], sys.argv[3]
 s = open(path).read()
-block = f"## In flight (write-ahead)\n{ts} — {summary}\n"
+block = f"## In flight (write-ahead)\n{ts}  {summary}\n"
 if "## In flight (write-ahead)" in s:
     # lambda replacement: a literal replacement string would interpret backslash escapes,
     # so an expectation containing e.g. \x raises re.error: bad escape (auditor 59246815).
