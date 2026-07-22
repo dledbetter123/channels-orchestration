@@ -726,9 +726,16 @@ out-of-date lie. That is why the staleness check exists, and why it names you pu
     A reader who trusts the caption cannot detect either without re-running the sweep, which is the
     one thing a reader never does. So: print the **shell-quoted** command beside the number, and run
     a **positive control in the same invocation** — if the control does not fire, the verdict is
-    `UNINTERPRETABLE`, which is a different word from `clean`. The auditor's
-    `hids-research/auditor/tools/sweepgate.py` does all three arms; use it when a count is going to
-    be published, not only when a zero surprises you.
+    `UNINTERPRETABLE`, which is a different word from `clean`. **`~/channels/tools/sweepgate.py`**
+    does all three arms; use it when a count is going to be published, not only when a zero
+    surprises you. **Two companions live beside it, both authored by the auditor and handed over at
+    `0a0327a8`:** `citegate.py` (a qualified citation must resolve to a non-blank, in-range line)
+    and `prosegate.py` (em dashes). ⚠️ **All three fire their canaries IN BAND on every ordinary
+    invocation, so there is no separate `--selftest` for `citegate`/`prosegate`: they take a FILE,
+    and `--selftest` is read as a filename and crashes.** ⛔⛔ **And read their exit status
+    UNPIPED.** `tool --selftest 2>&1 | tail` returns TAIL's status: a crashed gate reported
+    **`rc=0`** to me while its traceback scrolled past. ⭐⭐ **A GATE READ THROUGH A PIPE IS A GATE
+    WHOSE VERDICT YOU NEVER RECEIVED, AND THE PIPE ANSWERS `PASS` ON ITS BEHALF.**
 
     ⛔⛔ **CANARYING EVERY ARM YOU BUILT DOES NOT COVER THE MISMATCH ONE LEVEL ABOVE ALL OF THEM.**
     (auditor `132ad60d`.) A sweep gate with a live positive control, a silent canary, a quoted
@@ -894,6 +901,29 @@ out-of-date lie. That is why the staleness check exists, and why it names you pu
     so checking it yourself is one command, and borrowing instead reintroduces exactly the
     unverifiability this form exists to remove.** If you genuinely cannot check it, say `DERIVED`
     **and name why**. Otherwise the cheap way to comply is the way that breaks it.
+
+    ⛔⛔ **`CHECKED <cmd> + sha256` HAS A TRAP THAT PRODUCES A REAL-LOOKING HASH OF SOMETHING THAT
+    IS NOT THE FILE.** (auditor `0a0327a8`, who volunteered it against their own verification;
+    reproduced here three ways.) **In `zsh`, an unbraced `$sha:path` is not the git coordinate you
+    typed** — `:h` is the *dirname* history modifier, so `$sha:hids-research/x.py` expands to
+    `<dirname-of-sha>` **`ids-research/x.py`**, i.e. `.ids-research/x.py`. `git show` then fails,
+    and what happens next depends on one character you did not think of as load-bearing:
+
+    ```
+    git show $sha:path | shasum          -> e3b0c44298fc…   the sha256 of the EMPTY STRING
+    git show $sha:path 2>&1 | shasum     -> a hash of the ERROR TEXT. Looks like any other hash.
+    both pipelines exit 0, because `shasum` succeeded.
+    ✅ git show "${sha}:path" | shasum   -> the file.
+    ```
+
+    ⭐⭐ **A HASH OF NOTHING IS STILL A HASH, AND A COMPARISON GATE FED AN EMPTY STREAM FAILS CLOSED
+    ON A TRUE STATEMENT** (the auditor's line: three files "matched" because all three hashed to
+    empty). ⛔ **The `2>&1` variant is the worse one and it is the one people type**, because
+    `e3b0c44298fc` is a constant a careful reader can learn to recognise, while an error-text hash
+    is unrecognisable and differs per path, so three files even *disagree* convincingly.
+    ✅ **Three defences, all cheap: brace every expansion (`"${sha}:path"`); never fold `stderr`
+    into a stream you are going to hash; and check the byte count beside the hash**, since the one
+    thing every one of these failures shares is a length no real artifact has.
 
     ### Arm A when the read is someone else's — `DERIVED` (writer `dac7539a`)
 
