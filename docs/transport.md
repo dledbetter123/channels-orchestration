@@ -120,6 +120,83 @@ it delays every lane's mail by up to five minutes, which is a behavior change vi
 participant, and on this deployment that decision belongs to the coordinating role rather than
 to whoever owns the plumbing.
 
+## Polling is a mainstream design choice, not a shortcut
+
+The reflex reaction to "the notifier polls" is that polling is what you write before you learn
+about events. That reflex is worth checking against practice, because several of the most widely
+deployed systems in the industry are pull-based on purpose, and each one was pulled toward that
+choice by a property this system also has.
+
+**Kafka: the consumer pulls so the consumer controls the rate.** Kafka's design document states
+the case directly: "a push-based system has difficulty dealing with diverse consumers as the
+broker controls the rate at which data is transferred," whereas pull lets a slow consumer "fall
+behind and catch up when it can." It also names the batching argument, that a puller "always
+pulls all available messages after its current position in the log (or up to some configurable max
+size)," achieving "optimal batching without introducing unnecessary latency." That is the same
+argument made above about a tick emitting every accumulated line as one wake, and it is why our
+expensive component gets to decide when it is invoked rather than having that decided for it. Note
+also that Kafka concedes the exact deficiency this document concedes: with no data "the consumer
+may end up polling in a tight loop, effectively busy-waiting," which Kafka fixes with a long poll.
+Our equivalent fix is that the loop is a `sleep` in a shell, so an empty tick costs no inference.
+([Kafka design: push vs. pull](https://kafka.apache.org/43/design/design/))
+
+**Prometheus: the poll is the health check.** Prometheus scrapes its targets rather than receiving
+pushes, and its FAQ lists among the reasons that "you can more easily and reliably tell if a
+target is down" and "you can manually go to a target and inspect its health with a web browser."
+This is precisely accomplishment #2 above. A pull loop has a side effect a push channel does not:
+its own success or failure is a continuous statement about the liveness of the thing on the other
+end. In our case the direction is mirrored (the subscriber's loop attests to the subscriber rather
+than to the source), but the property being bought is the same one, and it is why "whose watch is
+alive" can serve as the role model's ground truth. Worth noting for honesty: the same FAQ declines
+to oversell it, calling pulling only "slightly better than pushing" and explicitly not a decisive
+reason to pick a monitoring system.
+([Prometheus FAQ](https://prometheus.io/docs/introduction/faq/))
+
+**Kubernetes: level-triggered, because a missed event must not corrupt state.** The Kubernetes
+architecture principles require that "functionality must be level-based, meaning the system must
+operate correctly given the desired state and the current/observed state, regardless of how many
+intermediate state updates may have been missed," alongside "assume an open world: continually
+verify assumptions and gracefully adapt to external events." Kubernetes controllers do receive
+edge notifications, but the notifications are only a hint to look again; correctness lives in the
+comparison of observed state against desired state. That is exactly the split this system makes.
+The mailbox is the level, the tick is the hint, and the notification is allowed to be lossy because
+nothing depends on any individual edge being seen. A lane that loses its watch for an hour and
+re-arms loses nothing, for the same structural reason a controller that misses a hundred events
+still converges.
+([Kubernetes architecture principles](https://github.com/kubernetes/design-proposals-archive/blob/main/architecture/principles.md))
+
+**SQS: pull-only, with the interval as the tuning knob.** Amazon SQS has no push mode at all;
+consumers call `ReceiveMessage`. AWS recommends long polling over the default short polling
+because it "helps reduce the cost of using Amazon SQS by reducing the number of empty responses,"
+and caps the wait at 20 seconds. The structural point for us is not the mechanism but the framing:
+AWS treats the wait time as the primary cost lever on a polled consumer, tunable per queue. That
+is the same lever this document identifies as unpulled. A managed service at AWS's scale ships
+polling as the only option and hands you the interval; the criticism worth making of our design is
+therefore not that it polls, it is that it never tuned the number.
+([SQS short and long polling](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-short-and-long-polling.html))
+
+**Google Cloud Pub/Sub: both are offered, and pull is the one recommended at volume.** Pub/Sub
+supports push and pull subscriptions side by side and recommends pull for a "large volume of
+messages (GBs per second)" and where "efficiency and throughput of message processing is
+critical," because pull "achieves high throughput at low CPU and bandwidth by allowing batched
+delivery," while push "delivers one message per request and limits the maximum number of
+outstanding messages." Push is recommended instead for webhook-shaped consumers and environments
+without the client infrastructure. This is the most useful precedent of the five, because it is
+the one where a vendor with no stake in the argument offers both and states the tradeoff: push
+optimizes per-message immediacy, pull optimizes batched throughput and consumer-side control.
+Given a subscriber for whom one message and twenty messages cost the same to receive, that
+tradeoff has one answer.
+([Pub/Sub: choose a subscription type](https://docs.cloud.google.com/pubsub/docs/subscriber))
+
+**What the precedent does and does not establish.** It establishes that pull is a considered
+position with a coherent rationale, held by Kafka, Prometheus, Kubernetes, SQS, and Pub/Sub, and
+that the arguments they give are the arguments this system relies on: consumer-controlled rate,
+batching, liveness as a side effect, and tolerance of missed notifications. It does not establish
+that our particular parameters are right. None of these systems would defend a poll interval
+chosen by default and never measured, and the measurement above says ours is doing 3% of the work
+usually attributed to it. Precedent legitimizes the shape of the design. The numbers inside it
+still have to be earned.
+
 ## Explicit coalescing, and why it is not redundant
 
 A digest mode holds new mail until the mailbox has been quiet for a configured window, then
