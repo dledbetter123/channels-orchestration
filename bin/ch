@@ -612,7 +612,12 @@ ensure_mail() { # <agent> — a mailbox starts EMPTY.
   # On a shared worktree a concurrent commit can transiently revert one file and not the other,
   # so an absent inbox would wipe a surviving seen and every message flips back to UNREAD
   # (researcher eafa4ce). Truncating a file you did not mean to create is the loss.
-  local agent="$1" box seen; box="$(mail_inbox "$agent")"; seen="$(mail_seen "$agent")"
+  local agent="$1" box seen
+  # An identity check belongs HERE rather than at each caller, because this is the function that
+  # brings the state file into existence: anything that reaches it with a non-identity mints a
+  # phantom lane that every later read then treats as real (writer 85740580 / auditor f4c1484c).
+  is_agent "$agent" || die "no such identity: $agent (a role, or <role>#N) — did you pass a project name?"
+  box="$(mail_inbox "$agent")"; seen="$(mail_seen "$agent")"
   mkdir -p "$(dirname "$box")"
   [ -f "$box" ]  || : > "$box"
   [ -f "$seen" ] || : > "$seen"
@@ -786,6 +791,12 @@ cmd_inbox() { # ch inbox <agent> [project] — the mailbox. Does NOT change stat
 # semantics, "read" everything up to that cursor. Record that, so it isn't re-shown.
 ensure_acks() { # <agent>
   local agent="$1" afile="$ROOT/.acks/$agent" cfile="$ROOT/.cursors/$agent"
+  # Same guard as ensure_mail, and this is the site that actually fired: `ch ack` calls ONLY
+  # ensure_acks, which is why the phantom left an .acks/ and a .receipts/ entry but no .mail/ dir.
+  # `ch ack <project> <sha>` printed "acked <sha>", exited 0, wrote 36 receipts to an identity
+  # that does not exist, and left the real lane's board count untouched — success indistinguishable
+  # from the failure it was hiding.
+  is_agent "$agent" || die "no such identity: $agent (a role, or <role>#N) — did you pass a project name?"
   [ -f "$afile" ] && return 0
   mkdir -p "$ROOT/.acks"; : > "$afile"
   if [ -f "$cfile" ]; then
