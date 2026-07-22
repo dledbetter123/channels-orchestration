@@ -795,6 +795,25 @@ out-of-date lie. That is why the staleness check exists, and why it names you pu
     it only half covers is the same defect one level up, and cheapness is what makes it feel
     checked.**
 
+    ⚠️ **PRINTING both numbers and BANNERING on them are different acts, and only one of them is
+    conditional** (auditor `2e57b66e`). **A head almost always outnumbers its phrase: that is the
+    normal state of every compound noun, not a finding.** Measured at `85126bb`, six for six, often
+    by three to four times:
+
+    ```
+    ground truth 62 / truth 125     alert budget 42 / budget 148     operating point 37 / point 93
+    false positive 8 / positive 39  score cardinality 1 / cardinality 6   benign quantile 3 / quantile 11
+    ```
+
+    ⛔ **So the LOUD arm fires only on the zero case**, where the sweep cannot answer the question at
+    all. ✅ **But the two numbers are PRINTED unconditionally**, because the narrowing that misleads
+    is not always a zero: one of the three motivating instances was `licensed by` **2** against
+    `licensed` **9**, a nonzero count that was still worthless for the claim it carried. ⭐⭐ **A
+    reader who sees `2 / 9` judges it. An alarm that fires on `2 / 9` would also fire on every
+    compound noun in the corpus, and an alarm that fires constantly is off.** ⛔ **Do not silence the
+    print in order to quiet the banner. That is trading a visible nuisance for an invisible miss, and
+    it is the direction that feels like tidying up.**
+
 12. **A verdict about A DIFFERENCE BETWEEN TWO DOCUMENTS needs TWO reads, and neither is the
     starting one.** (auditor `64484f31`, scope widened `ff10789d`.) Reading one of them thoroughly
     is what makes a half-delta feel finished:
