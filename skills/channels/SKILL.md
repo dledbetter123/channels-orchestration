@@ -730,6 +730,13 @@ out-of-date lie. That is why the staleness check exists, and why it names you pu
     `hids-research/auditor/tools/sweepgate.py` does all three arms; use it when a count is going to
     be published, not only when a zero surprises you.
 
+    ⚠️ **State the UNIT beside the pattern.** `-c` counts **lines**, `-o` counts **occurrences**, and
+    they differ whenever one line carries the term twice. Two lanes reporting `25` and `26` for the
+    same sweep were both right (`lift` at `85126bb`: 25 lines, 26 occurrences, doubled at
+    `Chapter3.tex:497`). **That was the third grain collision in one day across three lanes** — a
+    disagreement about units reads exactly like a disagreement about facts, and burns a round trip
+    every time.
+
     ⚠️ **Machine fact, verified on this box:** `git grep -E '\bword\b'` **silently returns 0** here
     (`lift`: 30 plain, **0** with `\b`, 25 truly word-bounded). It does not error. Any sweep relying
     on `\b` is failing open right now and looking green. **Working word boundaries: `git grep -w`,
@@ -745,6 +752,45 @@ out-of-date lie. That is why the staleness check exists, and why it names you pu
     assert on the EXIT CODE, never on empty output.** I re-learned this the wrong way round: my own
     check of it ran through the shell function and came back green, and only reading the writer's
     six-hours-earlier message corrected it.
+
+12. **A verdict about an EXTERNAL system needs TWO reads, and neither is the starting one.**
+    (auditor `64484f31`.) **A delta is a difference between two documents.** Reading one of them
+    thoroughly is what makes a half-delta feel finished:
+
+    - **Arm A — the external artifact at METHOD-AND-TABLE grain**, not its abstract. An abstract
+      states a result; only the method and tables state the **conditions**, and the conditions are
+      the delta.
+    - **Arm B — OUR corpus, grepped for the external system's NAME, at a committed coordinate.**
+
+    ⛔ **The load-bearing clause is the finding/remedy split. One arm may report a FINDING. It must
+    never propose a REMEDY**, because a remedy is a claim about the document you did not read. The
+    incident: an arm-A-only read of ProvFusion produced a *true* finding and a three-step remedy
+    whose step 1 was a **no-op** (our thesis already volunteered their number in four places) and
+    whose step 3 was a **regression** (it cut a 37-site term of art).
+
+    **Declare both arms in the message, as two lines, so a reader sees a half-delta instead of
+    taking your word that you looked:**
+
+    ```
+    DELTA ARM B   sweepgate --at 85126bb --pattern 'ProvFusion'  -> N occurrences on M lines
+                  git grep -F -o -n ProvFusion 85126bb -- '*.tex'
+    DELTA ARM A   2604.14685  sha256 4d8022a1…650c   ATTESTED: method + tables read
+    ```
+
+    ⛔ **The two lines are NOT the same kind of claim and must not be formatted as if they were.**
+    Arm B is **checkable** — it carries a command any reader can re-run. Arm A is an
+    **attestation**: the sha256 proves *which* document, never that the method section was read, and
+    nothing can verify a PDF was read. Write arm B first and label arm A `ATTESTED`, so the
+    unverifiable line cannot borrow the verifiable one's credibility. ⭐ **A block where an
+    attestation is dressed as a check is rule 8's failure wearing the rule's own uniform.**
+
+    ⚠️ **Required only when the message proposes a remedy or ruling touching our own corpus** — the
+    place the failure actually lives. A finding-only message says so (`FINDING ONLY — no remedy
+    licensed, arm B not run`) and is complete. **A declaration block demanded on every message gets
+    filled in by habit, and a ritual is not a check.**
+
+    This is a message-SHAPE rule, deliberately not a hook: nothing can verify arm A, and an alarm
+    that fires on correct verdicts is worse than no alarm.
 
 ## Multiple sessions on one role — LEADER + WORKERS
 
