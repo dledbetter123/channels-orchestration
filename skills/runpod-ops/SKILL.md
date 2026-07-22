@@ -89,7 +89,7 @@ that used zero GPU; one gate now stands between "a lane wants compute" and "mone
 - **The $1.50/hr authorization boundary is a POLICY, enforced by AGENTS, not by the account
   (operator directive 2026-07-18, enforcement corrected by the operator 2026-07-21).**
   tech-support provisions any right-sized configuration under **$1.50/hr** on its own authority (one
-  or two 4090s ~$1.38/hr, or a single GPU under the line). **Anything over $1.50/hr requires David's
+  or two 4090s ~$1.38/hr, or a single GPU under the line). **Anything over $1.50/hr requires the operator's
   explicit authorization**, routed through the researcher.
   - **CORRECTION, and read it before you reason about spend: the earlier "hard-blocked at the API"
     claim was WRONG and is withdrawn.** The RunPod account limit is **$80/hr and CANNOT be lowered**
@@ -98,10 +98,10 @@ that used zero GPU; one gate now stands between "a lane wants compute" and "mone
   - **What that means operationally:** nothing at the vendor stops a runaway before **$80/hr**. The
     entire defense is three soft, agent-side controls — tech-support's provisioning gate, the
     **$2/hr burn ceiling** caught within ~2 minutes by the burn-watch, and the throttled email that
-    reaches David with no session running. Treat every one of them as load-bearing; a missed
+    reaches the operator with no session running. Treat every one of them as load-bearing; a missed
     burn-watch is not a redundancy failure, it is the failure.
   - **A "raise the cap" request is now meaningless** — there is no cap to raise. Over-policy compute
-    is a DECISION David makes, not a setting anyone changes. tech-support does not route around the
+    is a DECISION the operator makes, not a setting anyone changes. tech-support does not route around the
     policy on the grounds that the account would technically allow it; the account allowing it is
     precisely the hazard this policy exists to cover.
 - This composes with everything below: the **$2/hr** tripwire, right-size, verified-not-redundant,

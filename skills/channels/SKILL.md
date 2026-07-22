@@ -24,7 +24,7 @@ Who receives what is **not** in this table — it is in `.subs/`, set by subscri
 Run `ch subs` to see it. Defaults are seeded when you first come online, and you can change
 them (`ch subscribe` / `ch unsubscribe`).
 
-`ops` is the operator lane: David broadcasts there, **everyone subscribes, no agent
+`ops` is the operator lane: the operator broadcasts there, **everyone subscribes, no agent
 publishes to it.** If an `ops` message is in your poll, read it before anything else.
 
 ## Chain of command — the researcher is the lead AND the sole operator interface
@@ -137,7 +137,7 @@ preference; it is how the operator wants to be driven.
   replying `re: <sha>` with the artifact path so the writer places it. A described graph is
   strictly worse than a drawn one. This round-trips today (builder subs writer, writer subs
   builder); it's additive to the builder's queue, not ahead of its funded research asks.
-- **Operator directives can arrive off the bus** — David may instruct an agent directly in its
+- **Operator directives can arrive off the bus** — the operator may instruct an agent directly in its
   own session, with no `ops` SHA behind it. Those are real; follow them. But loop the researcher
   in so the lead never loses the thread, and if an off-bus directive seems to *conflict* with a
   standing one, **confirm with the operator before publicly challenging it** — the operator has
@@ -152,14 +152,14 @@ preference; it is how the operator wants to be driven.
   tech-support's; if you think your own pod must die, say so, don't reach for the API. **The
   $1.50/hr authorization boundary is a POLICY, and it is enforced by AGENTS, not by the account
   (operator, 2026-07-21).** tech-support provisions any right-sized config under **$1.50/hr** on its
-  own authority; anything over **requires David's explicit authorization** via the researcher.
+  own authority; anything over **requires the operator's explicit authorization** via the researcher.
   **CORRECTION — the earlier claim that this is "hard-blocked at the API" was WRONG and is
   withdrawn.** The RunPod account limit is **$80/hr and cannot be lowered** (the API key lacks the
-  scope, and David has confirmed it is not adjustable). So nothing at the vendor stops a runaway
+  scope, and the operator has confirmed it is not adjustable). So nothing at the vendor stops a runaway
   before **$80/hr**: the only things standing in front of that number are tech-support's provisioning
   gate, the **$2/hr burn ceiling** with its ~2-minute burn-watch, and the throttled email alarm. Do
   not reason about spend as if a hardware backstop will catch you — **it will not.** Need more
-  compute than the policy allows → consult David; there is no cap to raise, so the answer is a
+  compute than the policy allows → consult the operator; there is no cap to raise, so the answer is a
   decision, not a setting. Full flow in `runpod-ops`.
 - **RunPod discipline is non-negotiable — full rules live in the `runpod-ops` skill; LOAD IT
   before you launch, connect to, monitor, or tear down any pod.** Do not run a pod from memory of
@@ -198,7 +198,7 @@ preference; it is how the operator wants to be driven.
     **REDONE right-sized, not paid for.** This is not a budget suggestion; it is a tripwire. `ch spend`
     and `ch board` raise a `⛔⛔ BURN CEILING BREACHED` alarm above `CHANNELS_BURN_CAP` (default $2),
     and tech-support runs a live burn-watch that catches a breach within ~2 minutes **and emails
-    David directly** (`ch notify`, throttled) so a runaway pod reaches him even when no session is
+    the operator directly** (`ch notify`, throttled) so a runaway pod reaches them even when no session is
     watching the terminal. On a breach: tech-support right-sizes or kills the pod immediately (kill
     authority is tech-support's); the owning lane does not let a >$2/hr job keep running while it
     "checks." Context: an 8×A100 rebuild burned **$286/day with 7 of 8 GPUs at 0%** before it was
@@ -649,6 +649,28 @@ out-of-date lie. That is why the staleness check exists, and why it names you pu
    via `ToolSearch`. Caveats: `WebSearch` is US-only, `WebFetch` cannot open authenticated
    URLs, and a *counterfactual* number that appears in no paper — a re-scored alert budget the
    authors never reported — is not fetchable and must be computed, not recollected.)
+
+8. **A verdict names a committed coordinate. Never certify an uncommitted working tree.**
+   (researcher `1c5fd4cb`, auditor's own rule from `b95ddf8f`.) An uncommitted tree has no
+   name, so the thing you certified and the thing anyone reads later are two different
+   objects, and nothing detects the substitution. This is not hypothetical: a certified
+   sentence changed **90 seconds** after the cert was issued. If the work you must verify is
+   not committed, the correct output is "cannot certify, no coordinate", not a verdict with a
+   caveat. **Say the SHA in the message.** A cert whose subject can change under it is not a
+   weaker cert, it is not a cert.
+
+9. **Committing another lane's work is a SYNCHRONIZED handoff, never an async snapshot.**
+   (researcher `1c5fd4cb`.) When a lane cannot commit its own finished work — its session is
+   build-blocked or permission-blocked — and you commit on its behalf, the exchange is:
+   owner sends **"tree is FINAL, safe to commit, expect `<content>`"** → you reply
+   **"committing now → `<SHA>`"**. Two messages, in that order, at that moment.
+   **An earlier "gates applied" status is not consent to commit** — it describes a past state
+   of a tree that is still being edited. In the incident that produced this rule the snapshot
+   happened to catch the correct sentence because an Edit had returned ~90 seconds earlier,
+   and ninety seconds the other way would have shipped the pre-fix text under a SHA the
+   auditor had just certified. ⭐ **A clean result does not make the timing safe. Judge the
+   race, not the outcome** — this rule exists because the lane that created the race is the
+   one that reported it, on a run that came out right.
 
 ## Multiple sessions on one role — LEADER + WORKERS
 
