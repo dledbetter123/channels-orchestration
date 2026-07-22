@@ -789,6 +789,48 @@ out-of-date lie. That is why the staleness check exists, and why it names you pu
     licensed, arm B not run`) and is complete. **A declaration block demanded on every message gets
     filled in by habit, and a ritual is not a check.**
 
+    ### Arm A when the read is someone else's — `DERIVED` (writer `dac7539a`)
+
+    **On this bus the remedy-proposer is usually NOT the reader, by design**: one lane holds the
+    primary source, another writes the prose. That lane can write neither `ATTESTED` (a lie) nor
+    `FINDING ONLY` (false — the remedy *is* licensed, just not by their own read), so the rule's
+    only honest move was silence, which is what the block exists to stop. The third state:
+
+    ```
+    DELTA ARM B   sweepgate --at 85126bb --pattern 'ProvFusion'  -> 19 occurrences on 19 lines
+                  git grep -F -o -n ProvFusion 85126bb -- '*.tex'
+    DELTA ARM A   2604.14685   NOT READ BY ME.  DERIVED from <sha> [, <sha>]
+                               CONDITION RELIED ON: <the one you are leaning on>
+    ```
+
+    ⛔ **`DERIVED` is NOT a lesser `ATTESTED` and the two are not a ladder.** They are different
+    relations, both legitimate. Ranking them creates pressure to "upgrade" by having a second lane
+    read the source, which is a *worse* design than the one we have — the borrowing is correct, only
+    the invisibility was wrong. (The writer proposed the ranking and then argued against it in the
+    same message: *"this does NOT license that I should read the paper."* They were right the second
+    time.)
+
+    - **Name a SHA, never a lane** — it points at a *read*, not at a reputation, and it makes the
+      dependency greppable: when a source read is revised, every remedy leaning on it can be
+      **found** instead of remembered.
+    - **Sits below arm B**, for the same reason `ATTESTED` does.
+    - ⚠️ **Its honest limit, stated in the rule rather than under it: `DERIVED <sha>` proves which
+      read licenses the remedy. It does NOT prove that read covered the condition you are leaning
+      on.** That is why the `CONDITION RELIED ON` line is part of the state and not decoration.
+
+    ⭐⭐ **The failure this exists for: A BORROWED ARM A TRANSMITS FINDINGS BUT NOT CONDITIONS, AND
+    THE CONDITIONS ARE THE DELTA.** A summary of someone else's read *is* an abstract, however
+    careful the summariser, so rule 12's own sentence applies one hop over. It is invisible because
+    the borrowing lane feels **well-informed rather than under-read**. The incident: a clause saying
+    we sit at 93 *"because that is where ProvFusion's own threshold falls"* — built from true
+    findings ("emergent", "imposes no budget") that simply never said what axis those thresholds
+    live on. They are per-view **score** thresholds; 93 is the alert-set **size** they produce. A
+    condition, not a finding, and the method section refutes the reconstruction.
+
+    ⭐ **The lender's half, and it is half the fix: when your read of a source licenses another
+    lane's wording change, state the CONDITION, not only the finding.** One line. The borrower
+    cannot ask for a condition they do not know exists.
+
     This is a message-SHAPE rule, deliberately not a hook: nothing can verify arm A, and an alarm
     that fires on correct verdicts is worse than no alarm.
 
