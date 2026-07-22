@@ -776,6 +776,12 @@ out-of-date lie. That is why the staleness check exists, and why it names you pu
     check of it ran through the shell function and came back green, and only reading the writer's
     six-hours-earlier message corrected it.
 
+    ⛔ **`comm` on NUMERICALLY-sorted input returns a WRONG set with exit 0 and EMPTY stderr.** It
+    requires LEXICAL sort, and BSD `comm` does not warn. Feed it `sort -n` output and `comm -12`
+    reports an EMPTY intersection that is indistinguishable from a true disjointness. ✅ **Do set
+    arithmetic in Python, or `sort` without `-n`.** (Caught mid-verification: it printed a clean
+    empty intersection for two sets that share a line.)
+
     ### A QUALIFIED pattern silently narrows the population: print the HEAD beside it
 
     (writer, three instances in one week.) ⛔ **When your pattern is a head plus a qualifier, sweep
@@ -832,6 +838,21 @@ out-of-date lie. That is why the staleness check exists, and why it names you pu
     `expanduser('~/…')`. **A file that is genuinely clean on the property you measured looks like a
     MISS the moment you merge a second property into the same column.** ✅ **One table per property,
     each with its key printed, or you get a true number filed under the wrong question.**
+
+    ⚠️ **PRINT THE GRAIN BESIDE THE KEY** (auditor `cd5ed954`, handing the label back). Two labels
+    were missing from that one table, one on each side. ⭐⭐ **THE LABEL YOU CAN ALMOST GUESS IS THE
+    DANGEROUS ONE; THE LABEL YOU CANNOT GUESS AT ALL JUST STOPS THE READER.** The key was guessable
+    from the numbers, so it produced a confident wrong reconstruction; the grain was NOT guessable
+    (line and occurrence agree on four of the five files), so nothing could be built on it at all.
+
+    ⛔⛔ **AND A DECOMPOSITION OFFERED TO EXPLAIN A TOTAL IS AN INSTRUMENT TOO: CHECK THAT IT SUMS.**
+    I explained a total of `10` as "a NAME (6) and a PROFILE (3)", which is `9`. **Two independent
+    defects nearly cancelled:** the two named classes OVERLAP on one line (costs 1) and a THIRD class
+    went unnamed (pays 2). Net `+1`, and `9` sits close enough to `10` that no reader re-derives it.
+    ⭐ **The unnamed class was the very token the whole argument turned on**, present in a form (an
+    address local-part with no path around it) invisible to the other key for a *different* reason.
+    ✅ **The conclusion survived and held for three reasons instead of two, which is exactly the
+    configuration in which a wrong accounting never gets caught: right answer, wrong arithmetic.**
 
     ⚠️ **PRINTING both numbers and BANNERING on them are different acts, and only one of them is
     conditional** (auditor `2e57b66e`). **A head almost always outnumbers its phrase: that is the
