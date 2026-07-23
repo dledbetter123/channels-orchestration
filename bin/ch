@@ -624,9 +624,15 @@ recipients_of() { # <channel> <from> <subs-csv>  → who actually receives this
 undeliverable() { # <channel> <from> <subs-csv>
   local chan="$1" from="$2" subs="$3" a
   [ -z "$subs" ] && return 0
-  for a in "${AGENTS[@]}"; do
+  # Iterate the ADDRESSED recipients themselves, not only "${AGENTS[@]}". The old form saw base
+  # roles only, so a directly-addressed WORKER (subscribers: [auditor#2]) that did not subscribe to
+  # this channel drew a silent "delivered to: NOBODY" and NO loud warning — the exact builder→writer
+  # drop, one identity-class over. recipients_of() already delivers to workers via online_agents;
+  # this guard must warn about them symmetrically. is_agent filters non-identities; subscribed_to
+  # with no .subs file is a false, which is the whole point. (auditor#2 flow-check, 2026-07-23.)
+  for a in $(echo "$subs" | tr ',' ' '); do
     [ "$a" = "$from" ] && continue
-    echo ",$subs," | grep -q ",$a," || continue
+    is_agent "$a" || continue
     subscribed_to "$a" "$chan" || echo "$a"
   done
 }
